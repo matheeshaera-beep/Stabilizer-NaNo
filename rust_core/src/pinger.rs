@@ -1,3 +1,4 @@
+use std::error::Error as StdError;
 use std::time::Duration;
 
 use reqwest::Client;
@@ -17,16 +18,21 @@ pub struct HttpPinger {
 }
 
 impl HttpPinger {
-    /// Constructs an `HttpPinger` with conservative timeouts and no redirect following.
+    /// Constructs an `HttpPinger` tuned for cellular radio wakeups without stale pooled sockets.
     pub fn new() -> Result<Self, String> {
         let client = Client::builder()
-            .connect_timeout(Duration::from_secs(4))
-            .timeout(Duration::from_secs(5))
+            .connect_timeout(Duration::from_secs(7))
+            .timeout(Duration::from_secs(9))
+            .pool_max_idle_per_host(0)
             .redirect(reqwest::redirect::Policy::none())
-            .pool_idle_timeout(Duration::from_secs(30))
             .user_agent("Stabilizer-NaNo/0.1")
             .build()
-            .map_err(|err| format!("failed to initialize HTTP client: {err}"))?;
+            .map_err(|err| {
+                format!(
+                    "failed to initialize HTTP client: {}",
+                    format_error_chain(&err)
+                )
+            })?;
 
         Ok(Self { client })
     }
@@ -39,7 +45,7 @@ impl HttpPinger {
             .head(url)
             .send()
             .await
-            .map_err(|err| format!("HEAD ping failed: {err}"))?;
+            .map_err(|err| format!("HEAD ping failed: {}", format_error_chain(&err)))?;
 
         let latency_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         let status_code = response.status().as_u16();
@@ -48,4 +54,14 @@ impl HttpPinger {
             latency_ms,
         })
     }
+}
+
+fn format_error_chain(err: &dyn StdError) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut current = err.source();
+    while let Some(source) = current {
+        parts.push(source.to_string());
+        current = source.source();
+    }
+    parts.join(": ")
 }

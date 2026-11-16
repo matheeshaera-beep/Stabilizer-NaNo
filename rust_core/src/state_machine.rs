@@ -1,5 +1,10 @@
 use std::fmt;
 
+/// Minimum non-self mobile throughput (bytes/sec) while screen is on or tethering is active
+/// to treat traffic as real user activity and suppress keepalive pings.
+/// Filters sub-1 KB/s background noise (system DNS via netd, mDNS, ARP, and idle keepalives).
+pub const ACTIVE_TRAFFIC_THRESHOLD_BYTES_PER_SEC: u64 = 1_024;
+
 /// Minimum non-self mobile throughput (bytes/sec) treated as an active download while the screen is off.
 pub const HEAVY_DOWNLOAD_BYTES_PER_SEC: u64 = 4_096;
 
@@ -320,6 +325,7 @@ impl StateMachine {
                     self.secs_since_last_ping = 0;
                     self.recovering_secs = 0;
                     self.root_recovery_triggered = false;
+                    self.recent_traffic_this_tick = false;
 
                     if self.has_internet && !self.is_validated {
                         self.transition_to(
@@ -478,7 +484,7 @@ impl StateMachine {
                 }
 
                 let counts_as_active = if self.is_screen_on || self.is_tethering {
-                    external_bytes_delta > 0
+                    external_bytes_delta >= ACTIVE_TRAFFIC_THRESHOLD_BYTES_PER_SEC
                 } else {
                     external_bytes_delta >= HEAVY_DOWNLOAD_BYTES_PER_SEC
                 };
@@ -489,12 +495,17 @@ impl StateMachine {
                     if self.state != StabilizerState::Recovering
                         && self.state != StabilizerState::Active
                     {
+                        let throughput_kbps = external_bytes_delta as f64 / 1024.0;
                         let msg = if !self.is_screen_on && !self.is_tethering {
-                            "Heavy screen-off download detected -> Active (0 pings)"
+                            format!(
+                                "Heavy screen-off download ({throughput_kbps:.1} KB/s) -> Active (0 pings)"
+                            )
                         } else {
-                            "Real mobile traffic detected -> Active (0 pings)"
+                            format!(
+                                "Real mobile traffic ({throughput_kbps:.1} KB/s) -> Active (0 pings)"
+                            )
                         };
-                        self.transition_to(StabilizerState::Active, msg, &mut actions);
+                        self.transition_to(StabilizerState::Active, &msg, &mut actions);
                     }
                 }
             }
@@ -552,11 +563,11 @@ impl StateMachine {
                     self.recent_traffic_this_tick = false;
                     self.idle_secs = 0;
                     if self.state != StabilizerState::Active {
-                        self.transition_to(
-                            StabilizerState::Active,
-                            "Real mobile traffic active -> Active (0 pings)",
-                            &mut actions,
+                        let throughput_kbps = self.last_traffic_bytes_per_sec as f64 / 1024.0;
+                        let msg = format!(
+                            "Real mobile traffic ({throughput_kbps:.1} KB/s) -> Active (0 pings)"
                         );
+                        self.transition_to(StabilizerState::Active, &msg, &mut actions);
                     }
                     return actions;
                 }
@@ -732,10 +743,39 @@ mod tests {
 
         // Real traffic immediately restores Active with 0 pings
         let resume_actions = sm.handle_event(Event::TrafficObserved {
-            external_bytes_delta: 512,
+            external_bytes_delta: 2048,
         });
         assert_eq!(sm.state(), StabilizerState::Active);
         assert_eq!(count_pings(&resume_actions), 0);
+    }
+
+    #[test]
+    fn sub_threshold_background_chatter_does_not_block_idle_ping() {
+        let mut sm = default_started_machine();
+        assert_eq!(sm.state(), StabilizerState::Warmup);
+
+        // Simulate sub-1 KB/s noise every second (e.g., netd DNS lookups, mDNS, ARP)
+        // for 4 seconds while screen is on and tethering is active.
+        sm.handle_event(Event::TetheringChanged { is_tethering: true });
+        sm.handle_event(Event::ScreenChanged {
+            is_screen_on: false,
+            is_unlocked: false,
+        });
+
+        let mut total_idle_pings = 0;
+        for _ in 0..5 {
+            sm.handle_event(Event::TrafficObserved {
+                external_bytes_delta: 256,
+            });
+            let actions = sm.handle_event(Event::Tick1s);
+            total_idle_pings += actions
+                .iter()
+                .filter(|a| **a == Action::SendPing(PingReason::IdleKeepalive))
+                .count();
+        }
+
+        assert_eq!(sm.state(), StabilizerState::IdlePing);
+        assert_eq!(total_idle_pings, 1);
     }
 
     #[test]
@@ -764,9 +804,15 @@ mod tests {
             assert_eq!(count_pings(&actions), 0);
         }
 
+        // Sub-threshold background chatter does not falsely wake Sleeping
+        sm.handle_event(Event::TrafficObserved {
+            external_bytes_delta: 256,
+        });
+        assert_eq!(sm.state(), StabilizerState::Sleeping);
+
         // Real traffic wakes Sleeping -> Active (0 pings)
         let traffic_actions = sm.handle_event(Event::TrafficObserved {
-            external_bytes_delta: 100,
+            external_bytes_delta: 2048,
         });
         assert_eq!(sm.state(), StabilizerState::Active);
         assert_eq!(count_pings(&traffic_actions), 0);
