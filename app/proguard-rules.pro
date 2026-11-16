@@ -1,0 +1,3 @@
+-keep class com.stabilizernano.uniffi.** { *; }
+-keep class com.sun.jna.** { *; }
+-dontwarn com.sun.jna.**

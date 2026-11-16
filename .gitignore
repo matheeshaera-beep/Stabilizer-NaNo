@@ -1,0 +1,15 @@
+# Rust
+rust_core/target/
+
+# Gradle / Android
+.gradle/
+build/
+app/build/
+local.properties
+*.iml
+.idea/
+.DS_Store
+
+# Generated UniFFI Kotlin bindings & native libs (built in CI or local build script)
+app/src/main/jniLibs/
+app/src/main/java/com/stabilizernano/uniffi/

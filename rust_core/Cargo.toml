@@ -1,0 +1,24 @@
+[package]
+name = "rust_core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+
+[lib]
+name = "rust_core"
+crate-type = ["lib", "cdylib"]
+
+[features]
+default = []
+cli = ["uniffi/cli"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi_bindgen.rs"
+required-features = ["cli"]
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+thiserror = "2.0"
+tokio = { version = "1.43", features = ["rt-multi-thread", "sync", "time", "macros"] }
+uniffi = { version = "0.32.2", features = ["tokio"] }

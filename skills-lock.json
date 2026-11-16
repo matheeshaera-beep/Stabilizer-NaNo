@@ -1,0 +1,29 @@
+{
+  "version": 2,
+  "skills": {
+    "android-jetpack-compose": {
+      "source": "TheBushidoCollective/han",
+      "sourceType": "github",
+      "skillPath": "plugins/specialized/android/skills/jetpack-compose/SKILL.md",
+      "computedHash": "ad4cec5dbd21c34b89994e0b578bb6d491efaca94e097d59af9d959feb64bf04"
+    },
+    "github-actions": {
+      "source": "callstackincubator/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/github-actions/SKILL.md",
+      "computedHash": "ad180ec4e5dbc0b73695c269cd9e1bae465222ab7afb27ea4df2c162efcaadee"
+    },
+    "rust-best-practices": {
+      "source": "apollographql/skills",
+      "sourceType": "github",
+      "skillPath": "skills/rust-best-practices/SKILL.md",
+      "computedHash": "7e12e68aa50152eb7ba9ea1f88ca5380c846ea0175f8ab6788bb79b7faf12ca0"
+    },
+    "rust-uniffi-building": {
+      "source": "full-stack-skills/rust-skills",
+      "sourceType": "github",
+      "skillPath": "skills/rust-uniffi-building/SKILL.md",
+      "computedHash": "1b2c9ba9730cb40a9280e4812bd024c65c4518c74dd2d58be5db1e085b2e824e"
+    }
+  }
+}

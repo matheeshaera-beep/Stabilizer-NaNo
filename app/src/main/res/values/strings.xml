@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Stabilizer-NaNo</string>
+    <string name="tile_label">Net Stabilizer</string>
+    <string name="notification_channel_name">Stabilizer Status</string>
+    <string name="notification_channel_desc">Low-priority ongoing indicator while Stabilizer-NaNo is monitoring cellular connectivity.</string>
+</resources>
