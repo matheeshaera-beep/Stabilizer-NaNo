@@ -17,15 +17,23 @@ import com.stabilizernano.uniffi.TelemetrySnapshot
 import com.stabilizernano.uniffi.defaultStabilizerConfig
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
+interface CellularNetworkDelegate {
+    fun bindCellularSocketFd(fd: Int): Boolean
+    fun requestAndroidRevalidation()
+    fun onBoostStateUpdated(active: Boolean)
+}
+
 object StabilizerRepository : StabilizerObserver {
-    private const val MAX_LOCAL_LOGS = 40
+    private const val MAX_LOCAL_LOGS = 50
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val initLock = Any()
@@ -40,7 +48,12 @@ object StabilizerRepository : StabilizerObserver {
     private var engine: StabilizerEngine? = null
 
     @Volatile
-    private var lastNotifiedTileState: Pair<Boolean, StabilizerState>? = null
+    private var networkDelegate: CellularNetworkDelegate? = null
+
+    @Volatile
+    private var lastNotifiedTileKey: Triple<Boolean, StabilizerState, Boolean>? = null
+
+    private var boostTimerJob: Job? = null
 
     private val _config = MutableStateFlow(defaultStabilizerConfig())
     val config: StateFlow<StabilizerConfig> = _config.asStateFlow()
@@ -48,16 +61,28 @@ object StabilizerRepository : StabilizerObserver {
     private val _telemetry = MutableStateFlow(
         TelemetrySnapshot(
             state = StabilizerState.STOPPED,
+            stateReason = "Stopped",
             isRunning = false,
+            recommendedSampleMs = 5_000UL,
             lastPingLatencyMs = null,
             totalPings = 0UL,
             successfulPings = 0UL,
             failedPings = 0UL,
-            lastTrafficBytesPerSec = 0UL,
+            totalProbeBytes = 0UL,
+            avoidedFixed4sPings = 0UL,
+            stallsDetected = 0UL,
+            stallsHealed = 0UL,
+            recoveriesTriggered = 0UL,
+            lastRxBytesPerSec = 0UL,
+            lastTxBytesPerSec = 0UL,
             hasInternetCapability = false,
             isValidated = false,
             isScreenOn = true,
+            isWifiDefault = false,
             isTethering = false,
+            hotspotClients = 0U,
+            boostActive = false,
+            isCalibrating = false,
             logs = emptyList()
         )
     )
@@ -68,6 +93,15 @@ object StabilizerRepository : StabilizerObserver {
 
     private val _errorBanner = MutableStateFlow<String?>(null)
     val errorBanner: StateFlow<String?> = _errorBanner.asStateFlow()
+
+    private val _boostRemainingMinutes = MutableStateFlow(0)
+    val boostRemainingMinutes: StateFlow<Int> = _boostRemainingMinutes.asStateFlow()
+
+    private val _rootTestStatus = MutableStateFlow<String?>(null)
+    val rootTestStatus: StateFlow<String?> = _rootTestStatus.asStateFlow()
+
+    private val _calibrationSummary = MutableStateFlow<String?>(null)
+    val calibrationSummary: StateFlow<String?> = _calibrationSummary.asStateFlow()
 
     fun ensureInitialized(context: Context): StabilizerEngine {
         val existing = engine
@@ -89,6 +123,10 @@ object StabilizerRepository : StabilizerObserver {
         }
     }
 
+    fun registerNetworkDelegate(delegate: CellularNetworkDelegate?) {
+        networkDelegate = delegate
+    }
+
     fun startService(context: Context) {
         ensureInitialized(context)
         val intent = Intent(context, StabilizerForegroundService::class.java).apply {
@@ -98,6 +136,7 @@ object StabilizerRepository : StabilizerObserver {
     }
 
     fun stopService(context: Context) {
+        cancelBoost()
         val intent = Intent(context, StabilizerForegroundService::class.java).apply {
             action = StabilizerForegroundService.ACTION_STOP
         }
@@ -109,6 +148,71 @@ object StabilizerRepository : StabilizerObserver {
             stopService(context)
         } else {
             startService(context)
+        }
+    }
+
+    fun toggleBoost(context: Context, minutes: Int = 30) {
+        if (_boostRemainingMinutes.value > 0) {
+            cancelBoost()
+        } else {
+            if (!_telemetry.value.isRunning) {
+                startService(context)
+            }
+            startBoost(minutes)
+        }
+    }
+
+    fun startBoost(minutes: Int = 30) {
+        boostTimerJob?.cancel()
+        _boostRemainingMinutes.value = minutes
+        networkDelegate?.onBoostStateUpdated(true)
+        appendLocalLog(LogLevel.INFO, "Live Boost enabled for ${minutes}m")
+
+        boostTimerJob = scope.launch {
+            var remaining = minutes
+            while (remaining > 0) {
+                delay(60_000L)
+                remaining -= 1
+                _boostRemainingMinutes.value = remaining
+            }
+            networkDelegate?.onBoostStateUpdated(false)
+            appendLocalLog(LogLevel.INFO, "Live Boost timer expired -> returning to Auto")
+        }
+    }
+
+    fun cancelBoost() {
+        val wasActive = _boostRemainingMinutes.value > 0
+        boostTimerJob?.cancel()
+        boostTimerJob = null
+        _boostRemainingMinutes.value = 0
+        if (wasActive) {
+            networkDelegate?.onBoostStateUpdated(false)
+            appendLocalLog(LogLevel.INFO, "Live Boost cancelled")
+        }
+    }
+
+    fun calibrateRadioTail(context: Context) {
+        val instance = ensureInitialized(context)
+        _calibrationSummary.value = "Calibrating carrier tail (3s..60s gaps)..."
+        instance.calibrateRadioTail()
+    }
+
+    fun probeNow(context: Context) {
+        ensureInitialized(context).probeNow()
+    }
+
+    fun testRootAccess() {
+        _rootTestStatus.value = "Checking su access..."
+        scope.launch {
+            val res = RootRecoveryHelper.testRootAccess()
+            res.onSuccess { msg ->
+                _rootTestStatus.value = msg
+                appendLocalLog(LogLevel.INFO, msg)
+            }.onFailure { err ->
+                val msg = err.message ?: "Root denied or su unavailable"
+                _rootTestStatus.value = "Failed: $msg"
+                appendLocalLog(LogLevel.WARN, "Root test failed: $msg")
+            }
         }
     }
 
@@ -149,15 +253,24 @@ object StabilizerRepository : StabilizerObserver {
 
     override fun onTelemetryUpdated(snapshot: TelemetrySnapshot) {
         _telemetry.value = snapshot
-        val tileKey = snapshot.isRunning to snapshot.state
-        if (lastNotifiedTileState != tileKey) {
-            lastNotifiedTileState = tileKey
+        val tileKey = Triple(snapshot.isRunning, snapshot.state, snapshot.boostActive)
+        if (lastNotifiedTileKey != tileKey) {
+            lastNotifiedTileKey = tileKey
             appContext?.let { StabilizerTileService.requestTileUpdate(it) }
         }
     }
 
+    override fun bindSocketToCellular(fd: Int): Boolean {
+        return networkDelegate?.bindCellularSocketFd(fd) ?: true
+    }
+
+    override fun onRequestAndroidRevalidation() {
+        appendLocalLog(LogLevel.WARN, "Step 2: triggering Android network re-validation...")
+        networkDelegate?.requestAndroidRevalidation()
+    }
+
     override fun onRequestRootRecovery() {
-        appendLocalLog(LogLevel.WARN, "Executing root cellular recovery (svc data toggle)...")
+        appendLocalLog(LogLevel.WARN, "Step 3: executing gated root cellular toggle...")
         scope.launch {
             val result = RootRecoveryHelper.toggleMobileDataAsRoot()
             result.onSuccess { msg ->
@@ -168,5 +281,12 @@ object StabilizerRepository : StabilizerObserver {
                 _errorBanner.value = "Root recovery failed: $message"
             }
         }
+    }
+
+    override fun onCalibrationFinished(recommendedTailSecs: ULong, summary: String) {
+        _calibrationSummary.value = summary
+        val updated = _config.value.copy(radioTailSecs = recommendedTailSecs)
+        _config.value = updated
+        preferences?.saveConfig(updated)
     }
 }

@@ -15,7 +15,7 @@ android {
         minSdk = 26
         targetSdk = 35
         versionCode = ciVersionCode ?: 1
-        versionName = if (ciVersionCode != null) "0.1.$ciVersionCode" else "0.1.0"
+        versionName = if (ciVersionCode != null) "0.2.$ciVersionCode" else "0.2.0"
 
         ndk {
             abiFilters += listOf("arm64-v8a")

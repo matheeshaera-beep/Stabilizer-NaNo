@@ -91,6 +91,9 @@ class MainActivity : ComponentActivity() {
                 val localLogs by StabilizerRepository.localLogs.collectAsStateWithLifecycle()
                 val errorBanner by StabilizerRepository.errorBanner.collectAsStateWithLifecycle()
                 val uiNotice by statusNotice.collectAsStateWithLifecycle()
+                val boostRemainingMins by StabilizerRepository.boostRemainingMinutes.collectAsStateWithLifecycle()
+                val rootTestStatus by StabilizerRepository.rootTestStatus.collectAsStateWithLifecycle()
+                val calibrationSummary by StabilizerRepository.calibrationSummary.collectAsStateWithLifecycle()
 
                 var isBatteryExempt by remember { mutableStateOf(checkBatteryOptimizationExempt()) }
                 val lifecycleOwner = LocalLifecycleOwner.current
@@ -112,7 +115,28 @@ class MainActivity : ComponentActivity() {
                     localLogs = localLogs,
                     errorBanner = errorBanner ?: uiNotice,
                     isBatteryExempt = isBatteryExempt,
+                    boostRemainingMinutes = boostRemainingMins,
+                    rootTestStatus = rootTestStatus,
+                    calibrationSummary = calibrationSummary,
                     onToggleRunning = { handleToggleService(telemetry.isRunning) },
+                    onSelectProfile = { profile ->
+                        val res = StabilizerRepository.updateConfig(
+                            applicationContext,
+                            config.copy(profile = profile)
+                        )
+                        if (res.isSuccess) {
+                            statusNotice.value = "Switched to ${profile.name.lowercase()} profile"
+                        }
+                    },
+                    onToggleBoost = { StabilizerRepository.toggleBoost(applicationContext, 30) },
+                    onProbeNow = {
+                        StabilizerRepository.probeNow(applicationContext)
+                        statusNotice.value = "Sent manual L2 probe"
+                    },
+                    onCalibrateTail = {
+                        StabilizerRepository.calibrateRadioTail(applicationContext)
+                    },
+                    onTestRoot = { StabilizerRepository.testRootAccess() },
                     onSaveConfig = { newConfig ->
                         val res = StabilizerRepository.updateConfig(applicationContext, newConfig)
                         if (res.isSuccess) {

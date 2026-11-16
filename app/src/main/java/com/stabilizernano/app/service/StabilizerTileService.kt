@@ -36,11 +36,13 @@ class StabilizerTileService : TileService() {
                 "Stopped"
             } else {
                 val base = when (snapshot.state) {
-                    StabilizerState.ACTIVE -> "Active"
-                    StabilizerState.IDLE_PING -> "IdlePing"
+                    StabilizerState.ACTIVE -> "Active • 0 pings"
+                    StabilizerState.ECO_TAIL_CHECK -> "Eco tail"
+                    StabilizerState.QUIET -> "Quiet • 0 pings"
+                    StabilizerState.LIVE_KEEPALIVE -> if (snapshot.boostActive) "Live Boost" else "Live"
                     StabilizerState.WARMUP -> "Warmup"
-                    StabilizerState.SLEEPING -> "Sleeping"
                     StabilizerState.RECOVERING -> "Recovering"
+                    StabilizerState.OUTAGE -> "No carrier data"
                     StabilizerState.STOPPED -> "Starting"
                 }
                 val latency = snapshot.lastPingLatencyMs?.let { " • ${it}ms" } ?: ""

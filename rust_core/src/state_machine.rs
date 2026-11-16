@@ -1,42 +1,84 @@
+use std::collections::VecDeque;
 use std::fmt;
 
-/// Minimum non-self mobile throughput (bytes/sec) while screen is on or tethering is active
-/// to treat traffic as real user activity and suppress keepalive pings.
-/// Filters sub-1 KB/s background noise (system DNS via netd, mDNS, ARP, and idle keepalives).
-pub const ACTIVE_TRAFFIC_THRESHOLD_BYTES_PER_SEC: u64 = 1_024;
+use crate::pinger::ProbeTier;
 
-/// Minimum non-self mobile throughput (bytes/sec) treated as an active download while the screen is off.
+/// Minimum downstream throughput (bytes/sec) treated as real RX user progress.
+pub const ACTIVE_RX_THRESHOLD_BYTES_PER_SEC: u64 = 1_024;
+
+/// Instant `Active` entry threshold (bytes/sec) for streaming / heavy downloads.
 pub const HEAVY_DOWNLOAD_BYTES_PER_SEC: u64 = 4_096;
 
-/// Grace period (seconds) before dropping from `Active` to `Sleeping` when the screen and tethering are off.
+/// Minimum sustained outbound traffic (bytes/sec) while RX is stalled to flag a silent freeze.
+pub const STALL_TX_THRESHOLD_BYTES_PER_SEC: u64 = 256;
+
+/// Upper bound on RX (bytes/sec) considered "no progress" during a TX stall (avoids false positives on small ACKs? No: slow uploads receive >64 B/s ACKs).
+pub const STALL_RX_CEILING_BYTES_PER_SEC: u64 = 64;
+
+/// Consecutive seconds of `TX >= 256 && RX < 64` before firing an instant stall-heal probe.
+pub const STALL_CONSECUTIVE_SECS: u64 = 3;
+
+/// Grace period (seconds) before dropping from `Active` to `Quiet` after a screen-off download stops.
 pub const SCREEN_OFF_DOWNLOAD_GRACE_SECS: u64 = 8;
 
-/// Operating state of the idle-aware network stabilizer.
+/// Maximum confirmation checks in `EcoTailCheck` before settling into `Quiet` (0 pings).
+pub const MAX_ECO_TAIL_CHECKS: u8 = 2;
+
+/// Minimum interval (seconds) between periodic L2 HTTP `HEAD` ground-truth checks while in `LiveKeepalive`.
+pub const LIVE_L2_REVERIFY_SECS: u64 = 600;
+
+/// Minimum cooldown (seconds) between root cellular recovery triggers.
+pub const ROOT_RECOVERY_COOLDOWN_SECS: u64 = 120;
+
+/// Sliding window (seconds) capping total root toggles (`MAX_ROOT_RECOVERIES_PER_WINDOW`).
+pub const ROOT_RECOVERY_WINDOW_SECS: u64 = 900;
+
+/// Maximum root cellular toggles allowed inside a 15-minute window.
+pub const MAX_ROOT_RECOVERIES_PER_WINDOW: usize = 3;
+
+/// User-selectable operating profile for Stabilizer-NaNo.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum StabilizerProfile {
+    /// Eco by default; automatically promotes to `LiveKeepalive` during calls, Boost, active hotspot/USB clients, or opted-in charging/gaming.
+    Auto,
+    /// Zero periodic keepalives after brief tail settle; wakes on real traffic, RX/TX stall, or radio topology events.
+    Eco,
+    /// Keeps the cellular modem inside its RRC tail window whenever screen is on (and safe battery/Wi-Fi checks pass).
+    Live,
+}
+
+/// Operating state of the Stabilizer-NaNo V2 engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum StabilizerState {
     /// Engine is stopped.
     Stopped,
-    /// Real mobile data traffic is actively moving; sends 0 keepalive pings.
-    Active,
-    /// Mobile traffic has been idle for `idle_threshold_secs`; sends 1 lightweight HEAD ping per idle window.
-    IdlePing,
-    /// Screen just turned on or unlocked; sends 1 instant HEAD ping immediately.
+    /// Immediate single probe on start, screen wake/unlock, or link restore.
     Warmup,
-    /// Screen is off with no background transfer/tethering, or screen is on in an offline app past `offline_sleep_secs`; sends 0 pings.
-    Sleeping,
-    /// `NET_CAPABILITY_VALIDATED` was lost while active; fires wake-up ping and optionally escalates to root recovery after timeout.
+    /// Real downstream (`rx`) traffic is moving (`>= 1 KB/s` hysteresis); sends **0 pings**.
+    Active,
+    /// Eco post-traffic confirmation window (`<= 2` L1 probes inside `radio_tail_secs`) before entering `Quiet`.
+    EcoTailCheck,
+    /// Zero-ping low-overhead standby (idle Eco, screen-off without clients, Wi-Fi default, Doze, or low battery).
+    Quiet,
+    /// Context-gated fast keepalive running slightly under `radio_tail_secs` with `±20%` jitter.
+    LiveKeepalive,
+    /// Non-root-first healing ladder triggered by TX stall or loss of `NET_CAPABILITY_VALIDATED`.
     Recovering,
+    /// Carrier outage backoff (`30s -> 60s -> 120s -> 300s`) after consecutive failed recovery ladders.
+    Outage,
 }
 
 impl fmt::Display for StabilizerState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Stopped => write!(f, "Stopped"),
-            Self::Active => write!(f, "Active"),
-            Self::IdlePing => write!(f, "IdlePing"),
             Self::Warmup => write!(f, "Warmup"),
-            Self::Sleeping => write!(f, "Sleeping"),
+            Self::Active => write!(f, "Active"),
+            Self::EcoTailCheck => write!(f, "EcoTailCheck"),
+            Self::Quiet => write!(f, "Quiet"),
+            Self::LiveKeepalive => write!(f, "LiveKeepalive"),
             Self::Recovering => write!(f, "Recovering"),
+            Self::Outage => write!(f, "Outage"),
         }
     }
 }
@@ -52,21 +94,27 @@ pub enum LogLevel {
 /// Configuration parameters for [`StabilizerEngine`](crate::StabilizerEngine).
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct StabilizerConfig {
+    pub profile: StabilizerProfile,
+    pub radio_tail_secs: u64,
     pub idle_threshold_secs: u64,
     pub offline_sleep_secs: u64,
     pub ping_url: String,
     pub root_recovery_enabled: bool,
     pub recovery_timeout_secs: u64,
+    pub live_on_charging: bool,
 }
 
 impl Default for StabilizerConfig {
     fn default() -> Self {
         Self {
+            profile: StabilizerProfile::Auto,
+            radio_tail_secs: 8,
             idle_threshold_secs: 4,
-            offline_sleep_secs: 120,
+            offline_sleep_secs: 60,
             ping_url: "https://connectivitycheck.gstatic.com/generate_204".to_owned(),
             root_recovery_enabled: false,
             recovery_timeout_secs: 10,
+            live_on_charging: false,
         }
     }
 }
@@ -74,6 +122,9 @@ impl Default for StabilizerConfig {
 impl StabilizerConfig {
     /// Validates user-supplied configuration bounds.
     pub fn validate(&self) -> Result<(), String> {
+        if !(4..=20).contains(&self.radio_tail_secs) {
+            return Err("radio_tail_secs must be between 4 and 20 seconds".to_owned());
+        }
         if self.idle_threshold_secs == 0 {
             return Err("idle_threshold_secs must be at least 1 second".to_owned());
         }
@@ -100,23 +151,49 @@ impl StabilizerConfig {
     }
 }
 
-/// Reason a keepalive `HEAD` ping was triggered.
+/// Real-time device & network context collected by Android.
+#[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Record)]
+pub struct RuntimeContext {
+    pub is_wifi_default: bool,
+    pub in_call: bool,
+    pub hotspot_clients: u32,
+    pub is_usb_or_bt_tethering: bool,
+    pub is_charging: bool,
+    pub low_battery_or_saver: bool,
+    pub is_doze: bool,
+    pub boost_active: bool,
+    pub live_app_active: bool,
+}
+
+impl RuntimeContext {
+    pub fn has_active_tethering(&self) -> bool {
+        self.hotspot_clients > 0 || self.is_usb_or_bt_tethering
+    }
+}
+
+/// Reason a cellular probe was triggered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PingReason {
     Warmup,
-    IdleKeepalive,
+    EcoTail,
+    LiveKeepalive,
+    LiveReverify,
+    StallCheck,
+    RadioEvent,
     Recovery,
+    OutageCheck,
 }
 
-/// Side-effect action emitted by the deterministic state machine.
+/// Side-effect action emitted by [`StateMachine`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
-    SendPing(PingReason),
+    SendProbe { tier: ProbeTier, reason: PingReason },
+    RequestAndroidRevalidation,
     TriggerRootRecovery,
     Log(LogLevel, String),
 }
 
-/// Input events processed by [`StateMachine`].
+/// Deterministic input events processed by [`StateMachine`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     Start,
@@ -125,61 +202,122 @@ pub enum Event {
         is_screen_on: bool,
         is_unlocked: bool,
     },
-    TetheringChanged {
-        is_tethering: bool,
-    },
+    ContextChanged(RuntimeContext),
     NetworkCapabilitiesChanged {
         has_internet: bool,
         is_validated: bool,
     },
-    TrafficObserved {
-        external_bytes_delta: u64,
+    RadioTopologyChanged {
+        reason: String,
     },
-    Tick1s,
+    TrafficObserved {
+        rx_bytes_delta: u64,
+        tx_bytes_delta: u64,
+    },
+    ProbeCompleted {
+        tier: ProbeTier,
+        reason: PingReason,
+        succeeded: bool,
+    },
+    TickElapsed {
+        secs: u64,
+    },
 }
 
-/// Pure, deterministic idle-aware state machine for mobile data stabilization.
+/// Pure, deterministic V2 state machine for Stabilizer-NaNo.
 #[derive(Debug)]
 pub struct StateMachine {
     config: StabilizerConfig,
+    context: RuntimeContext,
     state: StabilizerState,
+    state_reason: String,
     is_running: bool,
     is_screen_on: bool,
     is_unlocked: bool,
-    is_tethering: bool,
     has_internet: bool,
     is_validated: bool,
+
+    uptime_secs: u64,
     idle_secs: u64,
-    secs_since_last_ping: u64,
+    stall_secs: u64,
+    secs_since_last_probe: u64,
+    next_live_interval_secs: u64,
+    secs_since_l2_verify: u64,
+    eco_checks_sent: u8,
+
     recovering_secs: u64,
-    root_recovery_triggered: bool,
-    last_traffic_bytes_per_sec: u64,
-    recent_traffic_this_tick: bool,
+    android_revalidation_sent: bool,
+    root_recovery_sent_this_episode: bool,
+    root_recovery_history_secs: VecDeque<u64>,
+    consecutive_failed_ladders: u8,
+    outage_backoff_step: u8,
+    outage_wait_secs: u64,
+
+    rx_history: [bool; 3],
+    rx_history_idx: usize,
+    recent_rx_active_this_tick: bool,
+    last_rx_bytes_per_sec: u64,
+    last_tx_bytes_per_sec: u64,
+
+    rng_state: u64,
+    stalls_detected: u64,
+    stalls_healed: u64,
+    recoveries_triggered: u64,
+    android_revalidations: u64,
+    avoided_ping_accum_secs: u64,
+    avoided_fixed_4s_pings: u64,
 }
 
 impl StateMachine {
     /// Creates a new stopped state machine with the given validated configuration.
     pub fn new(config: StabilizerConfig) -> Self {
-        Self {
+        let mut sm = Self {
             config,
+            context: RuntimeContext::default(),
             state: StabilizerState::Stopped,
+            state_reason: "Stopped".to_owned(),
             is_running: false,
             is_screen_on: true,
             is_unlocked: true,
-            is_tethering: false,
             has_internet: false,
             is_validated: false,
+            uptime_secs: 0,
             idle_secs: 0,
-            secs_since_last_ping: 0,
+            stall_secs: 0,
+            secs_since_last_probe: 0,
+            next_live_interval_secs: 6,
+            secs_since_l2_verify: 0,
+            eco_checks_sent: 0,
             recovering_secs: 0,
-            root_recovery_triggered: false,
-            last_traffic_bytes_per_sec: 0,
-            recent_traffic_this_tick: false,
-        }
+            android_revalidation_sent: false,
+            root_recovery_sent_this_episode: false,
+            root_recovery_history_secs: VecDeque::new(),
+            consecutive_failed_ladders: 0,
+            outage_backoff_step: 0,
+            outage_wait_secs: 0,
+            rx_history: [false; 3],
+            rx_history_idx: 0,
+            recent_rx_active_this_tick: false,
+            last_rx_bytes_per_sec: 0,
+            last_tx_bytes_per_sec: 0,
+            rng_state: 0x9E37_79B9_7F4A_7C15,
+            stalls_detected: 0,
+            stalls_healed: 0,
+            recoveries_triggered: 0,
+            android_revalidations: 0,
+            avoided_ping_accum_secs: 0,
+            avoided_fixed_4s_pings: 0,
+        };
+        sm.recompute_next_live_interval();
+        sm
     }
 
     pub fn state(&self) -> StabilizerState {
         self.state
+    }
+
+    pub fn state_reason(&self) -> &str {
+        &self.state_reason
     }
 
     pub fn is_running(&self) -> bool {
@@ -191,7 +329,11 @@ impl StateMachine {
     }
 
     pub fn is_tethering(&self) -> bool {
-        self.is_tethering
+        self.context.has_active_tethering()
+    }
+
+    pub fn hotspot_clients(&self) -> u32 {
+        self.context.hotspot_clients
     }
 
     pub fn has_internet(&self) -> bool {
@@ -202,8 +344,32 @@ impl StateMachine {
         self.is_validated
     }
 
-    pub fn last_traffic_bytes_per_sec(&self) -> u64 {
-        self.last_traffic_bytes_per_sec
+    pub fn last_rx_bytes_per_sec(&self) -> u64 {
+        self.last_rx_bytes_per_sec
+    }
+
+    pub fn last_tx_bytes_per_sec(&self) -> u64 {
+        self.last_tx_bytes_per_sec
+    }
+
+    pub fn stalls_detected(&self) -> u64 {
+        self.stalls_detected
+    }
+
+    pub fn stalls_healed(&self) -> u64 {
+        self.stalls_healed
+    }
+
+    pub fn recoveries_triggered(&self) -> u64 {
+        self.recoveries_triggered
+    }
+
+    pub fn avoided_fixed_4s_pings(&self) -> u64 {
+        self.avoided_fixed_4s_pings
+    }
+
+    pub fn context(&self) -> &RuntimeContext {
+        &self.context
     }
 
     pub fn config(&self) -> &StabilizerConfig {
@@ -212,6 +378,58 @@ impl StateMachine {
 
     pub fn update_config(&mut self, config: StabilizerConfig) {
         self.config = config;
+        self.recompute_next_live_interval();
+    }
+
+    /// Returns `true` when Wi-Fi is default or power/Doze rules force zero-ping `Quiet` standby.
+    pub fn is_quiet_forced(&self) -> bool {
+        if self.context.is_wifi_default && !self.context.has_active_tethering() {
+            return true;
+        }
+        if self.context.low_battery_or_saver && !self.context.in_call && !self.context.boost_active
+        {
+            return true;
+        }
+        if (self.context.is_doze || !self.is_screen_on)
+            && !self.context.has_active_tethering()
+            && !self.context.in_call
+            && !self.context.boost_active
+            && !self.recent_rx_active_this_tick
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Returns `true` when context and profile justify keeping the cellular radio tail warm.
+    pub fn is_live_eligible(&self) -> bool {
+        if self.context.is_wifi_default && !self.context.has_active_tethering() {
+            return false;
+        }
+        if self.context.low_battery_or_saver {
+            return false;
+        }
+        if (self.context.is_doze || !self.is_screen_on)
+            && !self.context.has_active_tethering()
+            && !self.context.in_call
+            && !self.context.boost_active
+        {
+            return false;
+        }
+
+        match self.config.profile {
+            StabilizerProfile::Eco => false,
+            StabilizerProfile::Live => true,
+            StabilizerProfile::Auto => {
+                self.context.in_call
+                    || self.context.boost_active
+                    || self.context.has_active_tethering()
+                    || self.context.live_app_active
+                    || (self.config.live_on_charging
+                        && self.context.is_charging
+                        && self.is_screen_on)
+            }
+        }
     }
 
     /// Processes an [`Event`] and returns zero or more side-effect [`Action`]s.
@@ -224,36 +442,39 @@ impl StateMachine {
                     return actions;
                 }
                 self.is_running = true;
-                self.idle_secs = 0;
-                self.secs_since_last_ping = 0;
-                self.recovering_secs = 0;
-                self.root_recovery_triggered = false;
-                self.recent_traffic_this_tick = false;
+                self.reset_episode_timers();
+                self.consecutive_failed_ladders = 0;
+                self.outage_backoff_step = 0;
+                self.outage_wait_secs = 0;
 
-                if !self.is_screen_on && !self.is_tethering {
+                if self.context.is_wifi_default && !self.context.has_active_tethering() {
                     self.transition_to(
-                        StabilizerState::Sleeping,
-                        "Started while screen is off -> Sleeping (0 pings)",
+                        StabilizerState::Quiet,
+                        "Wi-Fi default -> Quiet (0 pings)",
+                        &mut actions,
+                    );
+                } else if self.is_quiet_forced() {
+                    self.transition_to(
+                        StabilizerState::Quiet,
+                        "Screen off / Doze -> Quiet (0 pings)",
                         &mut actions,
                     );
                 } else if self.has_internet && !self.is_validated {
-                    self.transition_to(
-                        StabilizerState::Recovering,
-                        "Started with unvalidated cellular link -> Recovering",
-                        &mut actions,
-                    );
-                    actions.push(Action::SendPing(PingReason::Recovery));
+                    self.enter_recovering("Started on unvalidated cellular link", &mut actions);
                 } else if self.has_internet {
                     self.transition_to(
                         StabilizerState::Warmup,
-                        "Stabilizer started -> Warmup HEAD ping",
+                        "Stabilizer started -> Warmup L2 check",
                         &mut actions,
                     );
-                    actions.push(Action::SendPing(PingReason::Warmup));
+                    actions.push(Action::SendProbe {
+                        tier: ProbeTier::L2HttpHead,
+                        reason: PingReason::Warmup,
+                    });
                 } else {
                     self.transition_to(
-                        StabilizerState::Active,
-                        "Stabilizer started -> waiting for cellular internet capability",
+                        StabilizerState::Quiet,
+                        "Waiting for cellular link -> Quiet",
                         &mut actions,
                     );
                 }
@@ -263,13 +484,11 @@ impl StateMachine {
                     return actions;
                 }
                 self.is_running = false;
-                self.idle_secs = 0;
-                self.secs_since_last_ping = 0;
-                self.recovering_secs = 0;
-                self.root_recovery_triggered = false;
-                self.recent_traffic_this_tick = false;
-                self.last_traffic_bytes_per_sec = 0;
-                self.transition_to(StabilizerState::Stopped, "Stabilizer stopped", &mut actions);
+                self.reset_episode_timers();
+                self.last_rx_bytes_per_sec = 0;
+                self.last_tx_bytes_per_sec = 0;
+                self.rx_history = [false; 3];
+                self.transition_to(StabilizerState::Stopped, "Stopped", &mut actions);
             }
             Event::ScreenChanged {
                 is_screen_on,
@@ -285,131 +504,131 @@ impl StateMachine {
                 }
 
                 if !is_screen_on {
-                    if self.is_tethering {
-                        if was_screen_on {
-                            actions.push(Action::Log(
-                                LogLevel::Info,
-                                "Screen off while tethering active -> keeping idle-aware mode"
-                                    .to_owned(),
-                            ));
-                        }
-                        return actions;
-                    }
-
-                    self.recovering_secs = 0;
-                    self.root_recovery_triggered = false;
-                    let download_active = self.recent_traffic_this_tick
-                        || (self.state == StabilizerState::Active
-                            && self.last_traffic_bytes_per_sec >= HEAVY_DOWNLOAD_BYTES_PER_SEC);
-                    if !download_active {
+                    if !self.context.has_active_tethering()
+                        && !self.context.in_call
+                        && !self.context.boost_active
+                        && !self.recent_rx_active_this_tick
+                        && self.state != StabilizerState::Quiet
+                        && self.state != StabilizerState::Outage
+                    {
+                        self.reset_recovery_episode();
                         self.transition_to(
-                            StabilizerState::Sleeping,
-                            "Screen off with no active transfer -> Sleeping (0 pings)",
+                            StabilizerState::Quiet,
+                            "Screen off -> Quiet (0 pings)",
                             &mut actions,
                         );
+                    } else if self.context.has_active_tethering() && was_screen_on {
+                        actions.push(Action::Log(
+                            LogLevel::Info,
+                            format!(
+                                "Screen off while tethering ({} clients) -> keeping Live",
+                                self.context.hotspot_clients
+                            ),
+                        ));
                     }
                     return actions;
                 }
 
                 let turned_on = !was_screen_on && is_screen_on;
-                let unlocked_while_idle_or_sleeping = is_screen_on
+                let unlocked_while_quiet = is_screen_on
                     && !was_unlocked
                     && is_unlocked
                     && matches!(
                         self.state,
-                        StabilizerState::Sleeping | StabilizerState::IdlePing
+                        StabilizerState::Quiet | StabilizerState::EcoTailCheck
                     );
 
-                if turned_on || unlocked_while_idle_or_sleeping {
+                if (turned_on || unlocked_while_quiet)
+                    && !(self.context.is_wifi_default && !self.context.has_active_tethering())
+                {
                     self.idle_secs = 0;
-                    self.secs_since_last_ping = 0;
-                    self.recovering_secs = 0;
-                    self.root_recovery_triggered = false;
-                    self.recent_traffic_this_tick = false;
+                    self.stall_secs = 0;
+                    self.eco_checks_sent = 0;
+                    self.secs_since_last_probe = 0;
+                    self.recent_rx_active_this_tick = false;
 
                     if self.has_internet && !self.is_validated {
-                        self.transition_to(
-                            StabilizerState::Recovering,
-                            "Screen wake with unvalidated cellular link -> Recovering",
-                            &mut actions,
-                        );
-                        actions.push(Action::SendPing(PingReason::Recovery));
+                        self.enter_recovering("Screen wake on unvalidated link", &mut actions);
                     } else if self.has_internet {
                         self.transition_to(
                             StabilizerState::Warmup,
-                            "Screen wake/unlock -> Warmup instant HEAD ping",
+                            "Screen wake -> Warmup check",
                             &mut actions,
                         );
-                        actions.push(Action::SendPing(PingReason::Warmup));
-                    } else {
-                        self.transition_to(
-                            StabilizerState::Warmup,
-                            "Screen wake/unlock -> waiting for cellular internet",
-                            &mut actions,
-                        );
+                        actions.push(Action::SendProbe {
+                            tier: ProbeTier::L1Dns,
+                            reason: PingReason::Warmup,
+                        });
                     }
                 }
             }
-            Event::TetheringChanged { is_tethering } => {
-                let was_tethering = self.is_tethering;
-                self.is_tethering = is_tethering;
+            Event::ContextChanged(new_ctx) => {
+                let prev_tether = self.context.has_active_tethering();
+                let prev_wifi = self.context.is_wifi_default;
+                let prev_live = self.is_live_eligible();
+                self.context = new_ctx;
 
-                if !self.is_running || was_tethering == is_tethering {
+                if !self.is_running {
                     return actions;
                 }
 
-                if is_tethering {
-                    if self.state == StabilizerState::Sleeping {
-                        self.idle_secs = 0;
-                        self.secs_since_last_ping = 0;
-                        self.recovering_secs = 0;
-                        self.root_recovery_triggered = false;
+                if self.context.is_wifi_default && !self.context.has_active_tethering() {
+                    if self.state != StabilizerState::Quiet {
+                        self.reset_recovery_episode();
+                        self.transition_to(
+                            StabilizerState::Quiet,
+                            "Wi-Fi default -> Quiet (0 pings)",
+                            &mut actions,
+                        );
+                    }
+                    return actions;
+                }
 
-                        if self.has_internet && !self.is_validated {
-                            self.transition_to(
-                                StabilizerState::Recovering,
-                                "Tethering enabled on unvalidated link -> Recovering",
-                                &mut actions,
-                            );
-                            actions.push(Action::SendPing(PingReason::Recovery));
-                        } else if self.has_internet {
-                            self.transition_to(
-                                StabilizerState::Warmup,
-                                "Hotspot/USB tethering active -> Warmup HEAD ping",
-                                &mut actions,
-                            );
-                            actions.push(Action::SendPing(PingReason::Warmup));
-                        } else {
-                            self.transition_to(
-                                StabilizerState::Active,
-                                "Hotspot/USB tethering active -> waiting for cellular link",
-                                &mut actions,
-                            );
-                        }
-                    } else {
-                        actions.push(Action::Log(
-                            LogLevel::Info,
-                            "Hotspot/USB tethering active -> sleep suppressed".to_owned(),
-                        ));
-                    }
-                } else {
-                    actions.push(Action::Log(
-                        LogLevel::Info,
-                        "Hotspot/USB tethering stopped".to_owned(),
-                    ));
-                    if !self.is_screen_on && !self.recent_traffic_this_tick {
-                        let grace = self
-                            .config
-                            .idle_threshold_secs
-                            .max(SCREEN_OFF_DOWNLOAD_GRACE_SECS);
-                        if self.state != StabilizerState::Active || self.idle_secs >= grace {
-                            self.transition_to(
-                                StabilizerState::Sleeping,
-                                "Tethering stopped while screen off -> Sleeping (0 pings)",
-                                &mut actions,
-                            );
-                        }
-                    }
+                if prev_wifi && !self.context.is_wifi_default && self.has_internet {
+                    self.idle_secs = 0;
+                    self.eco_checks_sent = 0;
+                    self.transition_to(
+                        StabilizerState::Warmup,
+                        "Switched to cellular -> Warmup check",
+                        &mut actions,
+                    );
+                    actions.push(Action::SendProbe {
+                        tier: ProbeTier::L1Dns,
+                        reason: PingReason::RadioEvent,
+                    });
+                    return actions;
+                }
+
+                if !prev_tether
+                    && self.context.has_active_tethering()
+                    && self.state == StabilizerState::Quiet
+                {
+                    self.idle_secs = 0;
+                    self.transition_to(
+                        StabilizerState::Warmup,
+                        "Tethering client connected -> Warmup",
+                        &mut actions,
+                    );
+                    actions.push(Action::SendProbe {
+                        tier: ProbeTier::L1Dns,
+                        reason: PingReason::Warmup,
+                    });
+                } else if self.is_quiet_forced()
+                    && !matches!(self.state, StabilizerState::Quiet | StabilizerState::Outage)
+                {
+                    self.transition_to(
+                        StabilizerState::Quiet,
+                        &self.quiet_reason_label(),
+                        &mut actions,
+                    );
+                } else if !prev_live
+                    && self.is_live_eligible()
+                    && self.state == StabilizerState::Quiet
+                {
+                    self.secs_since_last_probe = 0;
+                    self.recompute_next_live_interval();
+                    let label = self.live_reason_label();
+                    self.transition_to(StabilizerState::LiveKeepalive, &label, &mut actions);
                 }
             }
             Event::NetworkCapabilitiesChanged {
@@ -424,167 +643,317 @@ impl StateMachine {
                     return actions;
                 }
 
+                if self.context.is_wifi_default && !self.context.has_active_tethering() {
+                    return actions;
+                }
+
                 if has_internet && !is_validated {
-                    if self.state != StabilizerState::Sleeping
-                        && self.state != StabilizerState::Recovering
-                    {
-                        self.recovering_secs = 0;
-                        self.root_recovery_triggered = false;
-                        self.secs_since_last_ping = 0;
-                        self.transition_to(
-                            StabilizerState::Recovering,
-                            "Lost NET_CAPABILITY_VALIDATED -> Recovering wake-up ping",
-                            &mut actions,
-                        );
-                        actions.push(Action::SendPing(PingReason::Recovery));
+                    if !matches!(
+                        self.state,
+                        StabilizerState::Quiet
+                            | StabilizerState::Recovering
+                            | StabilizerState::Outage
+                    ) {
+                        self.enter_recovering("Lost NET_CAPABILITY_VALIDATED", &mut actions);
                     }
                 } else if has_internet && is_validated {
-                    if self.state == StabilizerState::Recovering {
-                        self.recovering_secs = 0;
-                        self.root_recovery_triggered = false;
-                        self.idle_secs = 0;
-                        let next_state = if !self.is_screen_on
-                            && !self.is_tethering
-                            && !self.recent_traffic_this_tick
-                        {
-                            StabilizerState::Sleeping
+                    self.consecutive_failed_ladders = 0;
+                    self.outage_backoff_step = 0;
+                    self.outage_wait_secs = 0;
+                    if matches!(
+                        self.state,
+                        StabilizerState::Recovering | StabilizerState::Outage
+                    ) {
+                        self.reset_recovery_episode();
+                        let next_state = if self.is_quiet_forced() {
+                            StabilizerState::Quiet
                         } else {
                             StabilizerState::Active
                         };
+                        self.transition_to(next_state, "Cellular link validated", &mut actions);
+                    } else if !had_internet && !self.is_quiet_forced() {
                         self.transition_to(
-                            next_state,
-                            "NET_CAPABILITY_VALIDATED restored",
+                            StabilizerState::Warmup,
+                            "Cellular internet restored -> Warmup",
                             &mut actions,
                         );
-                    } else if !had_internet && self.state == StabilizerState::Warmup {
-                        self.secs_since_last_ping = 0;
-                        actions.push(Action::SendPing(PingReason::Warmup));
+                        actions.push(Action::SendProbe {
+                            tier: ProbeTier::L1Dns,
+                            reason: PingReason::RadioEvent,
+                        });
                     }
-                } else if !has_internet && self.state == StabilizerState::Recovering {
-                    self.recovering_secs = 0;
-                    self.root_recovery_triggered = false;
-                    let next_state = if self.is_screen_on || self.is_tethering {
-                        StabilizerState::Active
-                    } else {
-                        StabilizerState::Sleeping
-                    };
+                } else if !has_internet && matches!(self.state, StabilizerState::Recovering) {
+                    self.reset_recovery_episode();
                     self.transition_to(
-                        next_state,
-                        "Cellular internet capability lost; pausing recovery",
+                        StabilizerState::Quiet,
+                        "Cellular internet lost -> Quiet",
                         &mut actions,
                     );
                 }
             }
+            Event::RadioTopologyChanged { reason } => {
+                if !self.is_running || !self.has_internet {
+                    return actions;
+                }
+                if self.context.is_wifi_default && !self.context.has_active_tethering() {
+                    return actions;
+                }
+                if self.state == StabilizerState::Active {
+                    return actions;
+                }
+                self.secs_since_last_probe = 0;
+                if self.state == StabilizerState::Outage {
+                    self.outage_wait_secs = 0;
+                    actions.push(Action::SendProbe {
+                        tier: ProbeTier::L2HttpHead,
+                        reason: PingReason::RadioEvent,
+                    });
+                } else if !self.is_quiet_forced() {
+                    let msg = format!("Radio event ({reason}) -> fresh check");
+                    self.transition_to(StabilizerState::Warmup, &msg, &mut actions);
+                    actions.push(Action::SendProbe {
+                        tier: ProbeTier::L1Dns,
+                        reason: PingReason::RadioEvent,
+                    });
+                }
+            }
             Event::TrafficObserved {
-                external_bytes_delta,
+                rx_bytes_delta,
+                tx_bytes_delta,
             } => {
-                self.last_traffic_bytes_per_sec = external_bytes_delta;
+                self.last_rx_bytes_per_sec = rx_bytes_delta;
+                self.last_tx_bytes_per_sec = tx_bytes_delta;
                 if !self.is_running {
                     return actions;
                 }
 
-                let counts_as_active = if self.is_screen_on || self.is_tethering {
-                    external_bytes_delta >= ACTIVE_TRAFFIC_THRESHOLD_BYTES_PER_SEC
-                } else {
-                    external_bytes_delta >= HEAVY_DOWNLOAD_BYTES_PER_SEC
-                };
+                let rx_is_strong = rx_bytes_delta >= ACTIVE_RX_THRESHOLD_BYTES_PER_SEC
+                    || (tx_bytes_delta >= ACTIVE_RX_THRESHOLD_BYTES_PER_SEC
+                        && rx_bytes_delta >= STALL_RX_CEILING_BYTES_PER_SEC);
+                self.rx_history[self.rx_history_idx] = rx_is_strong;
+                self.rx_history_idx = (self.rx_history_idx + 1) % 3;
+                let rx_hits = self.rx_history.iter().filter(|&&hit| hit).count();
 
-                if counts_as_active {
+                let enters_active = rx_bytes_delta >= HEAVY_DOWNLOAD_BYTES_PER_SEC || rx_hits >= 2;
+
+                if enters_active || (self.state == StabilizerState::Active && rx_is_strong) {
                     self.idle_secs = 0;
-                    self.recent_traffic_this_tick = true;
-                    if self.state != StabilizerState::Recovering
-                        && self.state != StabilizerState::Active
+                    self.stall_secs = 0;
+                    self.eco_checks_sent = 0;
+                    self.recent_rx_active_this_tick = true;
+
+                    if !matches!(
+                        self.state,
+                        StabilizerState::Active | StabilizerState::Recovering
+                    ) && !(self.context.is_wifi_default && !self.context.has_active_tethering())
                     {
-                        let throughput_kbps = external_bytes_delta as f64 / 1024.0;
-                        let msg = if !self.is_screen_on && !self.is_tethering {
-                            format!(
-                                "Heavy screen-off download ({throughput_kbps:.1} KB/s) -> Active (0 pings)"
-                            )
-                        } else {
-                            format!(
-                                "Real mobile traffic ({throughput_kbps:.1} KB/s) -> Active (0 pings)"
-                            )
-                        };
+                        self.consecutive_failed_ladders = 0;
+                        self.outage_backoff_step = 0;
+                        let kbps = rx_bytes_delta as f64 / 1024.0;
+                        let msg = format!("RX active ({kbps:.1} KB/s) -> 0 pings");
                         self.transition_to(StabilizerState::Active, &msg, &mut actions);
+                    }
+                    return actions;
+                }
+
+                self.recent_rx_active_this_tick = false;
+
+                // Silent link-freeze check: sustained outbound attempts/retransmits with ~zero RX.
+                let is_tx_stalled = tx_bytes_delta >= STALL_TX_THRESHOLD_BYTES_PER_SEC
+                    && rx_bytes_delta < STALL_RX_CEILING_BYTES_PER_SEC;
+                if !is_tx_stalled {
+                    self.stall_secs = 0;
+                }
+            }
+            Event::ProbeCompleted {
+                tier,
+                reason,
+                succeeded,
+            } => {
+                if !self.is_running {
+                    return actions;
+                }
+                if succeeded {
+                    self.consecutive_failed_ladders = 0;
+                    self.outage_backoff_step = 0;
+                    self.outage_wait_secs = 0;
+                    if reason == PingReason::StallCheck {
+                        self.stalls_healed = self.stalls_healed.saturating_add(1);
+                    }
+                    if matches!(
+                        self.state,
+                        StabilizerState::Recovering | StabilizerState::Outage
+                    ) {
+                        self.reset_recovery_episode();
+                        let next_state = if self.is_quiet_forced() {
+                            StabilizerState::Quiet
+                        } else if self.is_live_eligible() {
+                            StabilizerState::LiveKeepalive
+                        } else {
+                            StabilizerState::EcoTailCheck
+                        };
+                        self.transition_to(
+                            next_state,
+                            &format!("{tier:?} probe succeeded -> link healthy"),
+                            &mut actions,
+                        );
+                    }
+                } else {
+                    // L1 failure or StallCheck failure escalates into Recovering immediately.
+                    if matches!(
+                        self.state,
+                        StabilizerState::Warmup
+                            | StabilizerState::EcoTailCheck
+                            | StabilizerState::LiveKeepalive
+                    ) && !self.context.is_wifi_default
+                        && self.has_internet
+                    {
+                        self.enter_recovering(
+                            "Probe failed -> verifying cellular link",
+                            &mut actions,
+                        );
+                    } else if self.state == StabilizerState::Recovering
+                        && !self.android_revalidation_sent
+                    {
+                        self.android_revalidation_sent = true;
+                        self.android_revalidations = self.android_revalidations.saturating_add(1);
+                        actions.push(Action::Log(
+                            LogLevel::Warn,
+                            "Fresh probe failed -> requesting Android network re-validation"
+                                .to_owned(),
+                        ));
+                        actions.push(Action::RequestAndroidRevalidation);
                     }
                 }
             }
-            Event::Tick1s => {
+            Event::TickElapsed { secs } => {
+                let dt = secs.max(1);
                 if !self.is_running {
                     return actions;
                 }
+                self.uptime_secs = self.uptime_secs.saturating_add(dt);
+                self.secs_since_last_probe = self.secs_since_last_probe.saturating_add(dt);
+                self.secs_since_l2_verify = self.secs_since_l2_verify.saturating_add(dt);
 
-                self.secs_since_last_ping = self.secs_since_last_ping.saturating_add(1);
-                let keep_awake = self.is_screen_on || self.is_tethering;
-
-                if self.state == StabilizerState::Recovering {
-                    if self.recent_traffic_this_tick {
-                        self.recent_traffic_this_tick = false;
-                        self.idle_secs = 0;
-                    } else {
-                        self.idle_secs = self.idle_secs.saturating_add(1);
-                        let grace = self
-                            .config
-                            .idle_threshold_secs
-                            .max(SCREEN_OFF_DOWNLOAD_GRACE_SECS);
-                        if !keep_awake && self.idle_secs >= grace {
-                            self.recovering_secs = 0;
-                            self.root_recovery_triggered = false;
-                            self.transition_to(
-                                StabilizerState::Sleeping,
-                                "Screen off during recovery -> Sleeping (0 pings)",
-                                &mut actions,
-                            );
-                            return actions;
-                        }
+                // Count fixed-4s pings avoided while resting in Active, Quiet, or Outage.
+                if matches!(
+                    self.state,
+                    StabilizerState::Active | StabilizerState::Quiet | StabilizerState::Outage
+                ) {
+                    self.avoided_ping_accum_secs = self.avoided_ping_accum_secs.saturating_add(dt);
+                    let earned = self.avoided_ping_accum_secs / 4;
+                    if earned > 0 {
+                        self.avoided_ping_accum_secs %= 4;
+                        self.avoided_fixed_4s_pings =
+                            self.avoided_fixed_4s_pings.saturating_add(earned);
                     }
+                }
 
-                    self.recovering_secs = self.recovering_secs.saturating_add(1);
-                    if self.has_internet
-                        && !self.is_validated
-                        && self.recovering_secs >= self.config.recovery_timeout_secs
-                        && self.config.root_recovery_enabled
-                        && !self.root_recovery_triggered
-                    {
-                        self.root_recovery_triggered = true;
-                        actions.push(Action::Log(
-                            LogLevel::Warn,
-                            format!(
-                                "Network unvalidated for {}s -> requesting root cellular recovery",
-                                self.recovering_secs
-                            ),
-                        ));
-                        actions.push(Action::TriggerRootRecovery);
+                if self.context.is_wifi_default && !self.context.has_active_tethering() {
+                    if self.state != StabilizerState::Quiet {
+                        self.transition_to(
+                            StabilizerState::Quiet,
+                            "Wi-Fi default -> Quiet (0 pings)",
+                            &mut actions,
+                        );
                     }
                     return actions;
                 }
 
-                if self.recent_traffic_this_tick {
-                    self.recent_traffic_this_tick = false;
+                // Stall counter evaluation when TX > 0 and RX < 64 B/s.
+                let is_tx_stalled = self.last_tx_bytes_per_sec >= STALL_TX_THRESHOLD_BYTES_PER_SEC
+                    && self.last_rx_bytes_per_sec < STALL_RX_CEILING_BYTES_PER_SEC;
+                if is_tx_stalled
+                    && self.has_internet
+                    && !matches!(
+                        self.state,
+                        StabilizerState::Recovering | StabilizerState::Outage
+                    )
+                {
+                    self.stall_secs = self.stall_secs.saturating_add(dt);
+                    if self.stall_secs >= STALL_CONSECUTIVE_SECS {
+                        self.stall_secs = 0;
+                        self.stalls_detected = self.stalls_detected.saturating_add(1);
+                        self.enter_recovering(
+                            "Silent TX stall detected (RX stalled 3s)",
+                            &mut actions,
+                        );
+                        return actions;
+                    }
+                } else {
+                    self.stall_secs = 0;
+                }
+
+                // Recovering ladder progression.
+                if self.state == StabilizerState::Recovering {
+                    self.handle_recovering_tick(dt, &mut actions);
+                    return actions;
+                }
+
+                // Carrier Outage exponential backoff (30s -> 60s -> 120s -> 300s).
+                if self.state == StabilizerState::Outage {
+                    self.outage_wait_secs = self.outage_wait_secs.saturating_add(dt);
+                    let target_backoff = outage_backoff_secs(self.outage_backoff_step);
+                    if self.outage_wait_secs >= target_backoff {
+                        self.outage_wait_secs = 0;
+                        self.outage_backoff_step =
+                            self.outage_backoff_step.saturating_add(1).min(3);
+                        self.state_reason = format!(
+                            "No carrier data -> next retry in {}s",
+                            outage_backoff_secs(self.outage_backoff_step)
+                        );
+                        actions.push(Action::SendProbe {
+                            tier: ProbeTier::L1Dns,
+                            reason: PingReason::OutageCheck,
+                        });
+                    }
+                    return actions;
+                }
+
+                // Active RX traffic stays silent (0 pings).
+                if self.recent_rx_active_this_tick {
+                    self.recent_rx_active_this_tick = false;
                     self.idle_secs = 0;
                     if self.state != StabilizerState::Active {
-                        let throughput_kbps = self.last_traffic_bytes_per_sec as f64 / 1024.0;
-                        let msg = format!(
-                            "Real mobile traffic ({throughput_kbps:.1} KB/s) -> Active (0 pings)"
+                        self.transition_to(
+                            StabilizerState::Active,
+                            "RX traffic active -> 0 pings",
+                            &mut actions,
                         );
-                        self.transition_to(StabilizerState::Active, &msg, &mut actions);
                     }
                     return actions;
                 }
 
-                self.idle_secs = self.idle_secs.saturating_add(1);
+                self.idle_secs = self.idle_secs.saturating_add(dt);
 
-                if !keep_awake {
+                // Screen-off heavy download grace period before entering Quiet.
+                if self.state == StabilizerState::Active
+                    && !self.is_screen_on
+                    && !self.context.has_active_tethering()
+                {
                     let grace = self
                         .config
                         .idle_threshold_secs
                         .max(SCREEN_OFF_DOWNLOAD_GRACE_SECS);
-                    if self.state != StabilizerState::Sleeping && self.idle_secs >= grace {
+                    if self.idle_secs >= grace {
                         self.transition_to(
-                            StabilizerState::Sleeping,
-                            "Background transfer ended while screen off -> Sleeping (0 pings)",
+                            StabilizerState::Quiet,
+                            "Screen-off transfer finished -> Quiet (0 pings)",
                             &mut actions,
                         );
+                    }
+                    return actions;
+                }
+
+                if self.is_quiet_forced() {
+                    if self.state != StabilizerState::Quiet {
+                        self.transition_to(
+                            StabilizerState::Quiet,
+                            &self.quiet_reason_label(),
+                            &mut actions,
+                        );
+                    } else {
+                        self.state_reason = self.quiet_reason_label();
                     }
                     return actions;
                 }
@@ -594,45 +963,65 @@ impl StateMachine {
                 }
 
                 if !self.is_validated {
-                    self.recovering_secs = 0;
-                    self.root_recovery_triggered = false;
-                    self.secs_since_last_ping = 0;
+                    self.enter_recovering("Unvalidated cellular link", &mut actions);
+                    return actions;
+                }
+
+                // Decide Live vs Eco once idle beyond idle_threshold_secs.
+                if self.idle_secs < self.config.idle_threshold_secs {
+                    return actions;
+                }
+
+                if self.is_live_eligible() {
+                    let label = self.live_reason_label();
+                    if self.state != StabilizerState::LiveKeepalive {
+                        self.transition_to(StabilizerState::LiveKeepalive, &label, &mut actions);
+                    } else {
+                        self.state_reason = label;
+                    }
+
+                    if self.secs_since_last_probe >= self.next_live_interval_secs {
+                        self.secs_since_last_probe = 0;
+                        self.recompute_next_live_interval();
+                        let (tier, reason) = if self.secs_since_l2_verify >= LIVE_L2_REVERIFY_SECS {
+                            self.secs_since_l2_verify = 0;
+                            (ProbeTier::L2HttpHead, PingReason::LiveReverify)
+                        } else {
+                            (ProbeTier::L1Dns, PingReason::LiveKeepalive)
+                        };
+                        actions.push(Action::SendProbe { tier, reason });
+                    }
+                    return actions;
+                }
+
+                // Eco mode: send at most MAX_ECO_TAIL_CHECKS inside radio_tail_secs, then Quiet (0 pings).
+                if self.state == StabilizerState::Quiet {
+                    self.state_reason = self.quiet_reason_label();
+                    return actions;
+                }
+
+                if self.eco_checks_sent < MAX_ECO_TAIL_CHECKS {
+                    let eco_step_secs = (self.config.radio_tail_secs / 2).max(3);
+                    if self.secs_since_last_probe >= eco_step_secs {
+                        self.secs_since_last_probe = 0;
+                        self.eco_checks_sent = self.eco_checks_sent.saturating_add(1);
+                        let check_num = self.eco_checks_sent;
+                        self.transition_to(
+                            StabilizerState::EcoTailCheck,
+                            &format!("Eco tail check {check_num}/{MAX_ECO_TAIL_CHECKS}"),
+                            &mut actions,
+                        );
+                        actions.push(Action::SendProbe {
+                            tier: ProbeTier::L1Dns,
+                            reason: PingReason::EcoTail,
+                        });
+                    }
+                } else {
                     self.transition_to(
-                        StabilizerState::Recovering,
-                        "Unvalidated link while active -> Recovering",
+                        StabilizerState::Quiet,
+                        &self.quiet_reason_label(),
                         &mut actions,
                     );
-                    actions.push(Action::SendPing(PingReason::Recovery));
-                    return actions;
-                }
-
-                if !self.is_tethering && self.idle_secs >= self.config.offline_sleep_secs {
-                    if self.state != StabilizerState::Sleeping {
-                        self.transition_to(
-                            StabilizerState::Sleeping,
-                            "Offline app detected (no real traffic) -> Sleeping (0 pings)",
-                            &mut actions,
-                        );
-                    }
-                    return actions;
-                }
-
-                if self.state == StabilizerState::Sleeping {
-                    return actions;
-                }
-
-                if self.idle_secs >= self.config.idle_threshold_secs
-                    && self.secs_since_last_ping >= self.config.idle_threshold_secs
-                {
-                    self.secs_since_last_ping = 0;
-                    if self.state != StabilizerState::IdlePing {
-                        self.transition_to(
-                            StabilizerState::IdlePing,
-                            "Traffic idle threshold reached -> IdlePing HEAD probe",
-                            &mut actions,
-                        );
-                    }
-                    actions.push(Action::SendPing(PingReason::IdleKeepalive));
                 }
             }
         }
@@ -640,7 +1029,190 @@ impl StateMachine {
         actions
     }
 
+    fn handle_recovering_tick(&mut self, dt: u64, actions: &mut Vec<Action>) {
+        if self.is_quiet_forced() && !self.context.has_active_tethering() {
+            self.reset_recovery_episode();
+            self.transition_to(
+                StabilizerState::Quiet,
+                "Paused recovery while screen off -> Quiet",
+                actions,
+            );
+            return;
+        }
+
+        self.recovering_secs = self.recovering_secs.saturating_add(dt);
+
+        // Step 2: non-root Android re-validation after 3s.
+        if !self.android_revalidation_sent && self.recovering_secs >= 3 {
+            self.android_revalidation_sent = true;
+            self.android_revalidations = self.android_revalidations.saturating_add(1);
+            actions.push(Action::Log(
+                LogLevel::Warn,
+                "Recovery step 2 -> calling Android reportNetworkConnectivity(false)".to_owned(),
+            ));
+            actions.push(Action::RequestAndroidRevalidation);
+        }
+
+        // Step 3: gated Shizuku/root toggle after recovery_timeout_secs (3x grace if tethering clients).
+        let effective_timeout = if self.context.has_active_tethering() {
+            self.config.recovery_timeout_secs.saturating_mul(3)
+        } else {
+            self.config.recovery_timeout_secs
+        };
+
+        if self.recovering_secs >= effective_timeout && !self.root_recovery_sent_this_episode {
+            if self.can_trigger_root_recovery() {
+                self.root_recovery_sent_this_episode = true;
+                self.root_recovery_history_secs.push_back(self.uptime_secs);
+                self.recoveries_triggered = self.recoveries_triggered.saturating_add(1);
+                actions.push(Action::Log(
+                    LogLevel::Warn,
+                    format!(
+                        "Link unvalidated for {}s -> running gated cellular data toggle",
+                        self.recovering_secs
+                    ),
+                ));
+                actions.push(Action::TriggerRootRecovery);
+            } else if self.recovering_secs >= effective_timeout + 5 {
+                // Ladder exhausted (cooldown, call active, or root disabled) -> advance outage tracking.
+                self.escalate_recovery_failure(actions);
+            }
+            return;
+        }
+
+        // Step 4: if root ran and link still hasn't recovered within +8s, count failed ladder -> Outage.
+        if self.root_recovery_sent_this_episode && self.recovering_secs >= effective_timeout + 8 {
+            self.escalate_recovery_failure(actions);
+        }
+    }
+
+    fn escalate_recovery_failure(&mut self, actions: &mut Vec<Action>) {
+        self.consecutive_failed_ladders = self.consecutive_failed_ladders.saturating_add(1);
+        self.reset_recovery_episode();
+
+        if self.consecutive_failed_ladders >= 2 {
+            self.outage_backoff_step = 0;
+            self.outage_wait_secs = 0;
+            self.transition_to(
+                StabilizerState::Outage,
+                "No carrier data -> Outage backoff (30s)",
+                actions,
+            );
+        } else {
+            self.transition_to(
+                StabilizerState::Recovering,
+                "Recovery attempt 2 -> fresh L2 probe",
+                actions,
+            );
+            actions.push(Action::SendProbe {
+                tier: ProbeTier::L2HttpHead,
+                reason: PingReason::Recovery,
+            });
+        }
+    }
+
+    fn can_trigger_root_recovery(&mut self) -> bool {
+        if !self.config.root_recovery_enabled {
+            return false;
+        }
+        if self.context.in_call {
+            return false;
+        }
+        while let Some(&oldest) = self.root_recovery_history_secs.front() {
+            if self.uptime_secs.saturating_sub(oldest) >= ROOT_RECOVERY_WINDOW_SECS {
+                self.root_recovery_history_secs.pop_front();
+            } else {
+                break;
+            }
+        }
+        if self.root_recovery_history_secs.len() >= MAX_ROOT_RECOVERIES_PER_WINDOW {
+            return false;
+        }
+        if let Some(&last) = self.root_recovery_history_secs.back() {
+            if self.uptime_secs.saturating_sub(last) < ROOT_RECOVERY_COOLDOWN_SECS {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn enter_recovering(&mut self, reason: &str, actions: &mut Vec<Action>) {
+        self.reset_recovery_episode();
+        self.secs_since_last_probe = 0;
+        self.transition_to(
+            StabilizerState::Recovering,
+            &format!("{reason} -> Recovering L2 probe"),
+            actions,
+        );
+        actions.push(Action::SendProbe {
+            tier: ProbeTier::L2HttpHead,
+            reason: PingReason::StallCheck,
+        });
+    }
+
+    fn reset_episode_timers(&mut self) {
+        self.idle_secs = 0;
+        self.stall_secs = 0;
+        self.secs_since_last_probe = 0;
+        self.secs_since_l2_verify = 0;
+        self.eco_checks_sent = 0;
+        self.recent_rx_active_this_tick = false;
+        self.reset_recovery_episode();
+    }
+
+    fn reset_recovery_episode(&mut self) {
+        self.recovering_secs = 0;
+        self.android_revalidation_sent = false;
+        self.root_recovery_sent_this_episode = false;
+    }
+
+    fn recompute_next_live_interval(&mut self) {
+        let base = self.config.radio_tail_secs.saturating_sub(2).clamp(4, 10);
+        // Deterministic xorshift64 ±20% jitter.
+        self.rng_state ^= self.rng_state << 13;
+        self.rng_state ^= self.rng_state >> 7;
+        self.rng_state ^= self.rng_state << 17;
+        let pct_offset = (self.rng_state % 41) as i64 - 20; // [-20, +20]
+        let jittered = ((base as i64) * (100 + pct_offset) + 50) / 100;
+        self.next_live_interval_secs = (jittered.max(3)) as u64;
+    }
+
+    fn quiet_reason_label(&self) -> String {
+        if self.context.is_wifi_default && !self.context.has_active_tethering() {
+            "Quiet · Wi-Fi default · 0 pings".to_owned()
+        } else if self.context.low_battery_or_saver {
+            "Quiet · battery saver · 0 pings".to_owned()
+        } else if self.context.is_doze {
+            "Quiet · Doze · 0 pings".to_owned()
+        } else if !self.is_screen_on {
+            "Quiet · screen off · 0 pings".to_owned()
+        } else {
+            format!("Quiet · idle {}s · 0 pings", self.idle_secs)
+        }
+    }
+
+    fn live_reason_label(&self) -> String {
+        let base = self.config.radio_tail_secs.saturating_sub(2).clamp(4, 10);
+        if self.context.hotspot_clients > 0 {
+            format!(
+                "Live · hotspot ({}) · ~{base}s",
+                self.context.hotspot_clients
+            )
+        } else if self.context.is_usb_or_bt_tethering {
+            format!("Live · USB/BT tether · ~{base}s")
+        } else if self.context.in_call {
+            format!("Live · in call · ~{base}s")
+        } else if self.context.boost_active {
+            format!("Live · Boost active · ~{base}s")
+        } else if self.context.live_app_active {
+            format!("Live · game/app · ~{base}s")
+        } else {
+            format!("Live · profile · ~{base}s")
+        }
+    }
+
     fn transition_to(&mut self, next: StabilizerState, reason: &str, actions: &mut Vec<Action>) {
+        self.state_reason = reason.to_owned();
         if self.state != next {
             self.state = next;
             actions.push(Action::Log(LogLevel::Info, reason.to_owned()));
@@ -648,12 +1220,25 @@ impl StateMachine {
     }
 }
 
+fn outage_backoff_secs(step: u8) -> u64 {
+    match step {
+        0 => 30,
+        1 => 60,
+        2 => 120,
+        _ => 300,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn default_started_machine() -> StateMachine {
-        let mut sm = StateMachine::new(StabilizerConfig::default());
+    fn started_machine(profile: StabilizerProfile) -> StateMachine {
+        let cfg = StabilizerConfig {
+            profile,
+            ..StabilizerConfig::default()
+        };
+        let mut sm = StateMachine::new(cfg);
         sm.handle_event(Event::NetworkCapabilitiesChanged {
             has_internet: true,
             is_validated: true,
@@ -666,281 +1251,152 @@ mod tests {
         sm
     }
 
-    fn count_pings(actions: &[Action]) -> usize {
+    fn count_probes(actions: &[Action]) -> usize {
         actions
             .iter()
-            .filter(|a| matches!(a, Action::SendPing(_)))
+            .filter(|a| matches!(a, Action::SendProbe { .. }))
             .count()
     }
 
     #[test]
-    fn config_validation_rejects_invalid_values() {
-        let mut cfg = StabilizerConfig::default();
-        assert!(cfg.validate().is_ok());
+    fn eco_mode_sends_at_most_two_tail_checks_then_zero_in_quiet() {
+        let mut sm = started_machine(StabilizerProfile::Eco);
 
-        cfg.idle_threshold_secs = 0;
-        assert!(cfg.validate().is_err());
-
-        cfg = StabilizerConfig::default();
-        cfg.offline_sleep_secs = 2;
-        assert!(cfg.validate().is_err());
-
-        cfg = StabilizerConfig::default();
-        cfg.ping_url = "ftp://example.com".to_owned();
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn active_traffic_sends_zero_pings() {
-        let mut sm = default_started_machine();
-        assert_eq!(sm.state(), StabilizerState::Warmup);
-
-        for _ in 0..20 {
-            let mut actions = sm.handle_event(Event::TrafficObserved {
-                external_bytes_delta: 4096,
-            });
-            actions.extend(sm.handle_event(Event::Tick1s));
-            assert_eq!(sm.state(), StabilizerState::Active);
-            assert_eq!(count_pings(&actions), 0);
-        }
-    }
-
-    #[test]
-    fn idle_threshold_triggers_single_head_ping_after_4s() {
-        let mut sm = default_started_machine();
-        sm.handle_event(Event::TrafficObserved {
-            external_bytes_delta: 1024,
-        });
-        sm.handle_event(Event::Tick1s);
-        assert_eq!(sm.state(), StabilizerState::Active);
-
-        for second in 1..=3 {
-            let actions = sm.handle_event(Event::Tick1s);
-            assert_eq!(
-                sm.state(),
-                StabilizerState::Active,
-                "should remain Active at second {second}"
-            );
-            assert_eq!(count_pings(&actions), 0);
-        }
-
-        // 4th idle second triggers IdlePing + exactly 1 HEAD ping
-        let actions = sm.handle_event(Event::Tick1s);
-        assert_eq!(sm.state(), StabilizerState::IdlePing);
-        assert_eq!(
-            actions
-                .iter()
-                .filter(|a| **a == Action::SendPing(PingReason::IdleKeepalive))
-                .count(),
-            1
-        );
-
-        // Subsequent 3 seconds in IdlePing send 0 pings until next idle window
-        for _ in 0..3 {
-            let idle_actions = sm.handle_event(Event::Tick1s);
-            assert_eq!(count_pings(&idle_actions), 0);
-        }
-
-        // Real traffic immediately restores Active with 0 pings
-        let resume_actions = sm.handle_event(Event::TrafficObserved {
-            external_bytes_delta: 2048,
-        });
-        assert_eq!(sm.state(), StabilizerState::Active);
-        assert_eq!(count_pings(&resume_actions), 0);
-    }
-
-    #[test]
-    fn sub_threshold_background_chatter_does_not_block_idle_ping() {
-        let mut sm = default_started_machine();
-        assert_eq!(sm.state(), StabilizerState::Warmup);
-
-        // Simulate sub-1 KB/s noise every second (e.g., netd DNS lookups, mDNS, ARP)
-        // for 4 seconds while screen is on and tethering is active.
-        sm.handle_event(Event::TetheringChanged { is_tethering: true });
-        sm.handle_event(Event::ScreenChanged {
-            is_screen_on: false,
-            is_unlocked: false,
-        });
-
-        let mut total_idle_pings = 0;
-        for _ in 0..5 {
+        // 2 seconds of real RX settles into Active via 2-of-3 hysteresis
+        for _ in 0..2 {
             sm.handle_event(Event::TrafficObserved {
-                external_bytes_delta: 256,
+                rx_bytes_delta: 2_048,
+                tx_bytes_delta: 200,
             });
-            let actions = sm.handle_event(Event::Tick1s);
-            total_idle_pings += actions
-                .iter()
-                .filter(|a| **a == Action::SendPing(PingReason::IdleKeepalive))
-                .count();
+            let a = sm.handle_event(Event::TickElapsed { secs: 1 });
+            assert_eq!(count_probes(&a), 0);
+        }
+        assert_eq!(sm.state(), StabilizerState::Active);
+
+        // Idle for 2 minutes on screen -> <= 2 probes total, then Quiet (0 pings)
+        let mut total_probes = 0;
+        for _ in 0..120 {
+            sm.handle_event(Event::TrafficObserved {
+                rx_bytes_delta: 120,
+                tx_bytes_delta: 40,
+            });
+            let a = sm.handle_event(Event::TickElapsed { secs: 1 });
+            total_probes += count_probes(&a);
         }
 
-        assert_eq!(sm.state(), StabilizerState::IdlePing);
-        assert_eq!(total_idle_pings, 1);
+        assert_eq!(sm.state(), StabilizerState::Quiet);
+        assert!(
+            total_probes <= MAX_ECO_TAIL_CHECKS as usize,
+            "Eco sent {total_probes} probes; expected <= {MAX_ECO_TAIL_CHECKS}"
+        );
+        assert!(sm.avoided_fixed_4s_pings() > 15);
     }
 
     #[test]
-    fn offline_app_auto_sleeps_after_120s_with_zero_pings_until_traffic_or_wake() {
-        let mut sm = default_started_machine();
+    fn tx_stall_detection_heals_silent_freeze_without_false_upload_trigger() {
+        let mut sm = started_machine(StabilizerProfile::Auto);
         sm.handle_event(Event::TrafficObserved {
-            external_bytes_delta: 2048,
+            rx_bytes_delta: 8_192,
+            tx_bytes_delta: 1_024,
         });
-        sm.handle_event(Event::Tick1s);
+        sm.handle_event(Event::TickElapsed { secs: 1 });
         assert_eq!(sm.state(), StabilizerState::Active);
 
-        for _ in 1..120 {
-            sm.handle_event(Event::Tick1s);
-            assert_ne!(sm.state(), StabilizerState::Sleeping);
-        }
-
-        // At 120s of zero real non-ping traffic while screen is on -> Sleeping
-        let sleep_actions = sm.handle_event(Event::Tick1s);
-        assert_eq!(sm.state(), StabilizerState::Sleeping);
-        assert_eq!(count_pings(&sleep_actions), 0);
-
-        // Remains Sleeping with 0 pings for another 60s
-        for _ in 0..60 {
-            let actions = sm.handle_event(Event::Tick1s);
-            assert_eq!(sm.state(), StabilizerState::Sleeping);
-            assert_eq!(count_pings(&actions), 0);
-        }
-
-        // Sub-threshold background chatter does not falsely wake Sleeping
-        sm.handle_event(Event::TrafficObserved {
-            external_bytes_delta: 256,
-        });
-        assert_eq!(sm.state(), StabilizerState::Sleeping);
-
-        // Real traffic wakes Sleeping -> Active (0 pings)
-        let traffic_actions = sm.handle_event(Event::TrafficObserved {
-            external_bytes_delta: 2048,
-        });
-        assert_eq!(sm.state(), StabilizerState::Active);
-        assert_eq!(count_pings(&traffic_actions), 0);
-    }
-
-    #[test]
-    fn screen_off_sleeps_immediately_without_transfer_and_respects_grace_window_for_downloads() {
-        let mut sm = default_started_machine();
-
-        // Screen off with no active transfer -> Sleeping immediately
-        let off_actions = sm.handle_event(Event::ScreenChanged {
-            is_screen_on: false,
-            is_unlocked: false,
-        });
-        assert_eq!(sm.state(), StabilizerState::Sleeping);
-        assert_eq!(count_pings(&off_actions), 0);
-
-        // Heavy download starts while screen is off -> Active (0 pings)
+        // Slow upload receiving TCP ACKs (>= 64 B/s RX) does NOT false-stall.
         for _ in 0..10 {
-            let mut bg_actions = sm.handle_event(Event::TrafficObserved {
-                external_bytes_delta: 64_000,
+            sm.handle_event(Event::TrafficObserved {
+                rx_bytes_delta: 120,
+                tx_bytes_delta: 2_048,
             });
-            bg_actions.extend(sm.handle_event(Event::Tick1s));
-            assert_eq!(sm.state(), StabilizerState::Active);
-            assert_eq!(count_pings(&bg_actions), 0);
+            let a = sm.handle_event(Event::TickElapsed { secs: 1 });
+            assert_ne!(sm.state(), StabilizerState::Recovering);
+            assert_eq!(count_probes(&a), 0);
         }
 
-        // Brief pause (< 8s grace window) stays Active with 0 pings
-        for _ in 0..(SCREEN_OFF_DOWNLOAD_GRACE_SECS - 1) {
-            let pause_actions = sm.handle_event(Event::Tick1s);
-            assert_eq!(sm.state(), StabilizerState::Active);
-            assert_eq!(count_pings(&pause_actions), 0);
+        // Silent freeze: TX retransmitting (>= 256 B/s) while RX < 64 B/s for 3s -> immediate L2 probe!
+        let mut triggered = false;
+        for _ in 0..3 {
+            sm.handle_event(Event::TrafficObserved {
+                rx_bytes_delta: 0,
+                tx_bytes_delta: 600,
+            });
+            let a = sm.handle_event(Event::TickElapsed { secs: 1 });
+            if a.iter().any(|act| {
+                matches!(
+                    act,
+                    Action::SendProbe {
+                        tier: ProbeTier::L2HttpHead,
+                        reason: PingReason::StallCheck
+                    }
+                )
+            }) {
+                triggered = true;
+            }
         }
+        assert!(
+            triggered,
+            "TX stall must trigger instant L2 StallCheck probe"
+        );
+        assert_eq!(sm.state(), StabilizerState::Recovering);
+        assert_eq!(sm.stalls_detected(), 1);
 
-        // After grace window elapses with no download traffic -> Sleeping (0 pings)
-        let end_bg_actions = sm.handle_event(Event::Tick1s);
-        assert_eq!(sm.state(), StabilizerState::Sleeping);
-        assert_eq!(count_pings(&end_bg_actions), 0);
+        // Probe succeeds -> increments stalls_healed and exits Recovering
+        sm.handle_event(Event::ProbeCompleted {
+            tier: ProbeTier::L2HttpHead,
+            reason: PingReason::StallCheck,
+            succeeded: true,
+        });
+        assert_eq!(sm.stalls_healed(), 1);
+        assert_ne!(sm.state(), StabilizerState::Recovering);
     }
 
     #[test]
-    fn tethering_keeps_idle_aware_mode_when_screen_off_and_never_sleeps() {
-        let mut sm = default_started_machine();
-        sm.handle_event(Event::TetheringChanged { is_tethering: true });
-        assert!(sm.is_tethering());
+    fn hotspot_with_zero_clients_sleeps_while_one_client_runs_live_even_screen_off() {
+        let mut sm = started_machine(StabilizerProfile::Auto);
 
-        // Turn screen off while tethering is active -> does NOT sleep
-        let off_actions = sm.handle_event(Event::ScreenChanged {
-            is_screen_on: false,
-            is_unlocked: false,
-        });
-        assert_ne!(sm.state(), StabilizerState::Sleeping);
-        assert_eq!(count_pings(&off_actions), 0);
-
-        // Tethered laptop downloads -> Active with 0 pings
-        let mut dl_actions = sm.handle_event(Event::TrafficObserved {
-            external_bytes_delta: 32_768,
-        });
-        dl_actions.extend(sm.handle_event(Event::Tick1s));
-        assert_eq!(sm.state(), StabilizerState::Active);
-        assert_eq!(count_pings(&dl_actions), 0);
-
-        // Quiet period past idle_threshold_secs (4s) -> IdlePing with keepalive pings, even past 120s
-        let mut total_idle_pings = 0;
-        for _ in 0..140 {
-            let actions = sm.handle_event(Event::Tick1s);
-            assert_ne!(sm.state(), StabilizerState::Sleeping);
-            total_idle_pings += count_pings(&actions);
-        }
-        assert_eq!(sm.state(), StabilizerState::IdlePing);
-        assert!(total_idle_pings > 0);
-
-        // Disabling tethering while screen is off returns to Sleeping (0 pings)
-        let untether_actions = sm.handle_event(Event::TetheringChanged {
-            is_tethering: false,
-        });
-        assert_eq!(sm.state(), StabilizerState::Sleeping);
-        assert_eq!(count_pings(&untether_actions), 0);
-    }
-
-    #[test]
-    fn screen_on_and_unlock_trigger_warmup_ping_immediately() {
-        let mut sm = default_started_machine();
+        // Hotspot ON with 0 clients & screen off -> Quiet (0 pings)
+        sm.handle_event(Event::ContextChanged(RuntimeContext {
+            hotspot_clients: 0,
+            ..RuntimeContext::default()
+        }));
         sm.handle_event(Event::ScreenChanged {
             is_screen_on: false,
             is_unlocked: false,
         });
-        assert_eq!(sm.state(), StabilizerState::Sleeping);
-
-        // Screen turns on -> Warmup + 1 instant HEAD ping
-        let wake_actions = sm.handle_event(Event::ScreenChanged {
-            is_screen_on: true,
-            is_unlocked: false,
-        });
-        assert_eq!(sm.state(), StabilizerState::Warmup);
-        assert_eq!(
-            wake_actions
-                .iter()
-                .filter(|a| **a == Action::SendPing(PingReason::Warmup))
-                .count(),
-            1
-        );
-
-        // If user was in IdlePing and unlocks screen -> Warmup + 1 instant HEAD ping
-        for _ in 0..4 {
-            sm.handle_event(Event::Tick1s);
+        assert_eq!(sm.state(), StabilizerState::Quiet);
+        for _ in 0..20 {
+            let a = sm.handle_event(Event::TickElapsed { secs: 1 });
+            assert_eq!(count_probes(&a), 0);
         }
-        assert_eq!(sm.state(), StabilizerState::IdlePing);
 
-        let unlock_actions = sm.handle_event(Event::ScreenChanged {
-            is_screen_on: true,
-            is_unlocked: true,
-        });
-        assert_eq!(sm.state(), StabilizerState::Warmup);
-        assert_eq!(
-            unlock_actions
-                .iter()
-                .filter(|a| **a == Action::SendPing(PingReason::Warmup))
-                .count(),
-            1
-        );
+        // Client connects -> LiveKeepalive even with screen off
+        sm.handle_event(Event::ContextChanged(RuntimeContext {
+            hotspot_clients: 1,
+            ..RuntimeContext::default()
+        }));
+        let mut live_probes = 0;
+        for _ in 0..25 {
+            let a = sm.handle_event(Event::TickElapsed { secs: 1 });
+            live_probes += count_probes(&a);
+        }
+        assert_eq!(sm.state(), StabilizerState::LiveKeepalive);
+        assert!(live_probes >= 2);
+
+        // Wifi becomes default -> Quiet (0 pings)
+        sm.handle_event(Event::ContextChanged(RuntimeContext {
+            is_wifi_default: true,
+            hotspot_clients: 0,
+            ..RuntimeContext::default()
+        }));
+        assert_eq!(sm.state(), StabilizerState::Quiet);
     }
 
     #[test]
-    fn losing_validation_enters_recovering_and_triggers_root_after_timeout() {
+    fn recovery_ladder_respects_call_guard_cooldown_max_3_per_15m_and_enters_outage() {
         let cfg = StabilizerConfig {
+            profile: StabilizerProfile::Live,
             root_recovery_enabled: true,
-            recovery_timeout_secs: 10,
+            recovery_timeout_secs: 5,
             ..StabilizerConfig::default()
         };
         let mut sm = StateMachine::new(cfg);
@@ -948,69 +1404,146 @@ mod tests {
             has_internet: true,
             is_validated: true,
         });
-        sm.handle_event(Event::ScreenChanged {
-            is_screen_on: true,
-            is_unlocked: true,
-        });
         sm.handle_event(Event::Start);
 
-        // Validation lost while active -> Recovering + immediate wake-up ping
-        let loss_actions = sm.handle_event(Event::NetworkCapabilitiesChanged {
+        // During a voice call, root toggle MUST NEVER fire
+        sm.handle_event(Event::ContextChanged(RuntimeContext {
+            in_call: true,
+            ..RuntimeContext::default()
+        }));
+        sm.handle_event(Event::NetworkCapabilitiesChanged {
             has_internet: true,
             is_validated: false,
         });
-        assert_eq!(sm.state(), StabilizerState::Recovering);
-        assert_eq!(
-            loss_actions
-                .iter()
-                .filter(|a| **a == Action::SendPing(PingReason::Recovery))
-                .count(),
-            1
-        );
-
-        // 9 seconds unvalidated -> no root recovery yet
-        for _ in 1..10 {
-            let tick_actions = sm.handle_event(Event::Tick1s);
-            assert!(!tick_actions.contains(&Action::TriggerRootRecovery));
+        let mut saw_reval = false;
+        let mut saw_root = false;
+        for _ in 0..20 {
+            let a = sm.handle_event(Event::TickElapsed { secs: 1 });
+            if a.contains(&Action::RequestAndroidRevalidation) {
+                saw_reval = true;
+            }
+            if a.contains(&Action::TriggerRootRecovery) {
+                saw_root = true;
+            }
         }
+        assert!(saw_reval, "Android non-root revalidation should still run");
+        assert!(!saw_root, "Root recovery must be blocked during calls");
+        assert_eq!(sm.state(), StabilizerState::Outage);
 
-        // 10th second unvalidated -> triggers root recovery exactly once
-        let timeout_actions = sm.handle_event(Event::Tick1s);
-        assert!(timeout_actions.contains(&Action::TriggerRootRecovery));
-
-        let extra_tick = sm.handle_event(Event::Tick1s);
-        assert!(!extra_tick.contains(&Action::TriggerRootRecovery));
-
-        // Validation returns -> exits Recovering back to Active
+        // Restore validation, leave call, and verify root cooldown + max 3 per 15m + Outage
+        sm.handle_event(Event::ContextChanged(RuntimeContext::default()));
         sm.handle_event(Event::NetworkCapabilitiesChanged {
             has_internet: true,
             is_validated: true,
         });
-        assert_eq!(sm.state(), StabilizerState::Active);
+
+        let mut root_count = 0;
+        for episode in 0..5 {
+            sm.handle_event(Event::NetworkCapabilitiesChanged {
+                has_internet: true,
+                is_validated: false,
+            });
+            for _ in 0..16 {
+                let a = sm.handle_event(Event::TickElapsed { secs: 1 });
+                if a.contains(&Action::TriggerRootRecovery) {
+                    root_count += 1;
+                }
+            }
+            if episode < 4 {
+                // Re-validate and advance 130s only for first 3 episodes; test cooldown on 4th
+                sm.handle_event(Event::NetworkCapabilitiesChanged {
+                    has_internet: true,
+                    is_validated: true,
+                });
+                let step = if episode < 2 { 130 } else { 30 };
+                sm.handle_event(Event::TickElapsed { secs: step });
+            }
+        }
+        assert_eq!(
+            root_count, 3,
+            "Root recovery must enforce 120s cooldown and max 3 per 15m"
+        );
     }
 
     #[test]
-    fn root_recovery_not_triggered_when_disabled() {
-        let cfg = StabilizerConfig {
-            root_recovery_enabled: false,
-            recovery_timeout_secs: 10,
-            ..StabilizerConfig::default()
+    fn fuzzed_fsm_invariants_hold_across_2000_random_traces() {
+        let mut seed = 0xCAFE_BABE_1234_5678u64;
+        let mut next_u64 = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
         };
-        let mut sm = StateMachine::new(cfg);
-        sm.handle_event(Event::NetworkCapabilitiesChanged {
-            has_internet: true,
-            is_validated: true,
-        });
-        sm.handle_event(Event::Start);
-        sm.handle_event(Event::NetworkCapabilitiesChanged {
-            has_internet: true,
-            is_validated: false,
-        });
-        assert_eq!(sm.state(), StabilizerState::Recovering);
 
-        for _ in 0..15 {
-            let actions = sm.handle_event(Event::Tick1s);
-            assert!(!actions.contains(&Action::TriggerRootRecovery));
+        for _ in 0..2_000 {
+            let profile = match next_u64() % 3 {
+                0 => StabilizerProfile::Auto,
+                1 => StabilizerProfile::Eco,
+                _ => StabilizerProfile::Live,
+            };
+            let mut sm = StateMachine::new(StabilizerConfig {
+                profile,
+                root_recovery_enabled: (next_u64() % 2) == 0,
+                ..StabilizerConfig::default()
+            });
+            sm.handle_event(Event::Start);
+
+            for _ in 0..100 {
+                let ev = match next_u64() % 7 {
+                    0 => Event::ScreenChanged {
+                        is_screen_on: (next_u64() % 2) == 0,
+                        is_unlocked: (next_u64() % 2) == 0,
+                    },
+                    1 => Event::ContextChanged(RuntimeContext {
+                        is_wifi_default: (next_u64() % 4) == 0,
+                        in_call: (next_u64() % 8) == 0,
+                        hotspot_clients: (next_u64() % 3) as u32,
+                        is_usb_or_bt_tethering: (next_u64() % 6) == 0,
+                        is_charging: (next_u64() % 2) == 0,
+                        low_battery_or_saver: (next_u64() % 5) == 0,
+                        is_doze: (next_u64() % 6) == 0,
+                        boost_active: (next_u64() % 5) == 0,
+                        live_app_active: (next_u64() % 6) == 0,
+                    }),
+                    2 => Event::NetworkCapabilitiesChanged {
+                        has_internet: (next_u64() % 5) != 0,
+                        is_validated: (next_u64() % 3) != 0,
+                    },
+                    3 => Event::TrafficObserved {
+                        rx_bytes_delta: next_u64() % 12_000,
+                        tx_bytes_delta: next_u64() % 2_000,
+                    },
+                    4 => Event::ProbeCompleted {
+                        tier: ProbeTier::L1Dns,
+                        reason: PingReason::LiveKeepalive,
+                        succeeded: (next_u64() % 4) != 0,
+                    },
+                    5 => Event::RadioTopologyChanged {
+                        reason: "5G handover".to_owned(),
+                    },
+                    _ => Event::TickElapsed {
+                        secs: 1 + (next_u64() % 5),
+                    },
+                };
+
+                let actions = sm.handle_event(ev);
+                // Invariant 1: Never emit SendProbe when resting in Active or Quiet.
+                if matches!(sm.state(), StabilizerState::Active | StabilizerState::Quiet) {
+                    assert_eq!(
+                        count_probes(&actions),
+                        0,
+                        "violated 0-probe invariant in {:?}",
+                        sm.state()
+                    );
+                }
+                // Invariant 2: Never trigger root recovery while in a call.
+                if sm.context().in_call {
+                    assert!(
+                        !actions.contains(&Action::TriggerRootRecovery),
+                        "root recovery triggered during call"
+                    );
+                }
+            }
         }
     }
 }

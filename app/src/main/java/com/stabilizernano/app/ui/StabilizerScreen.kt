@@ -52,22 +52,30 @@ import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.Dashboard
 import androidx.compose.material.icons.rounded.DeleteSweep
+import androidx.compose.material.icons.rounded.NetworkCheck
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.SaveAlt
+import androidx.compose.material.icons.rounded.Security
 import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material.icons.rounded.Speed
 import androidx.compose.material.icons.rounded.Stop
 import androidx.compose.material.icons.rounded.Terminal
 import androidx.compose.material.icons.rounded.Warning
+import androidx.compose.material.icons.rounded.Wifi
 import androidx.compose.material.icons.rounded.WifiTethering
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilledTonalIconButton
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
@@ -100,6 +108,7 @@ import androidx.compose.ui.unit.dp
 import com.stabilizernano.uniffi.LogEntry
 import com.stabilizernano.uniffi.LogLevel
 import com.stabilizernano.uniffi.StabilizerConfig
+import com.stabilizernano.uniffi.StabilizerProfile
 import com.stabilizernano.uniffi.StabilizerState
 import com.stabilizernano.uniffi.TelemetrySnapshot
 import java.text.SimpleDateFormat
@@ -120,7 +129,15 @@ fun StabilizerScreen(
     localLogs: List<LogEntry>,
     errorBanner: String?,
     isBatteryExempt: Boolean,
+    boostRemainingMinutes: Int,
+    rootTestStatus: String?,
+    calibrationSummary: String?,
     onToggleRunning: () -> Unit,
+    onSelectProfile: (StabilizerProfile) -> Unit,
+    onToggleBoost: () -> Unit,
+    onProbeNow: () -> Unit,
+    onCalibrateTail: () -> Unit,
+    onTestRoot: () -> Unit,
     onSaveConfig: (StabilizerConfig) -> Unit,
     onClearLogs: () -> Unit,
     onExportLogsFile: (List<LogEntry>) -> Unit,
@@ -132,17 +149,20 @@ fun StabilizerScreen(
     val snackbarHostState = remember { SnackbarHostState() }
     var selectedTab by rememberSaveable { mutableStateOf(StabilizerTab.MAIN) }
 
+    var tailInput by remember(config.radioTailSecs) {
+        mutableStateOf(config.radioTailSecs.toString())
+    }
     var idleInput by remember(config.idleThresholdSecs) {
         mutableStateOf(config.idleThresholdSecs.toString())
-    }
-    var sleepInput by remember(config.offlineSleepSecs) {
-        mutableStateOf(config.offlineSleepSecs.toString())
     }
     var pingUrlInput by remember(config.pingUrl) {
         mutableStateOf(config.pingUrl)
     }
     var rootEnabledInput by remember(config.rootRecoveryEnabled) {
         mutableStateOf(config.rootRecoveryEnabled)
+    }
+    var liveChargingInput by remember(config.liveOnCharging) {
+        mutableStateOf(config.liveOnCharging)
     }
 
     LaunchedEffect(errorBanner) {
@@ -155,7 +175,7 @@ fun StabilizerScreen(
     val mergedLogs = remember(telemetry.logs, localLogs) {
         (telemetry.logs + localLogs)
             .sortedByDescending { it.timestampMs }
-            .take(140)
+            .take(160)
     }
 
     Scaffold(
@@ -181,7 +201,7 @@ fun StabilizerScreen(
                             fontWeight = FontWeight.Bold
                         )
                         Text(
-                            text = "Idle-aware Rust + UniFFI keeper",
+                            text = "Cellular tail & stall-heal engine • Tail ${config.radioTailSecs}s",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -222,8 +242,13 @@ fun StabilizerScreen(
                 when (tab) {
                     StabilizerTab.MAIN -> MainTabContent(
                         telemetry = telemetry,
+                        profile = config.profile,
                         isBatteryExempt = isBatteryExempt,
+                        boostRemainingMinutes = boostRemainingMinutes,
                         onToggleRunning = onToggleRunning,
+                        onSelectProfile = onSelectProfile,
+                        onToggleBoost = onToggleBoost,
+                        onProbeNow = onProbeNow,
                         onRequestBatteryExemption = onRequestBatteryExemption
                     )
                     StabilizerTab.LOGS -> LogsTabContent(
@@ -233,25 +258,36 @@ fun StabilizerScreen(
                         onShowNotice = onShowNotice
                     )
                     StabilizerTab.SETTINGS -> SettingsTabContent(
+                        profile = config.profile,
+                        onSelectProfile = onSelectProfile,
+                        tailInput = tailInput,
+                        onTailChange = { tailInput = it.filter(Char::isDigit) },
                         idleInput = idleInput,
                         onIdleChange = { idleInput = it.filter(Char::isDigit) },
-                        sleepInput = sleepInput,
-                        onSleepChange = { sleepInput = it.filter(Char::isDigit) },
                         pingUrlInput = pingUrlInput,
                         onPingUrlChange = { pingUrlInput = it },
                         rootEnabled = rootEnabledInput,
                         onRootEnabledChange = { rootEnabledInput = it },
+                        liveOnCharging = liveChargingInput,
+                        onLiveOnChargingChange = { liveChargingInput = it },
+                        isCalibrating = telemetry.isCalibrating,
+                        calibrationSummary = calibrationSummary,
+                        rootTestStatus = rootTestStatus,
                         isBatteryExempt = isBatteryExempt,
+                        onCalibrateTail = onCalibrateTail,
+                        onTestRoot = onTestRoot,
                         onRequestBatteryExemption = onRequestBatteryExemption,
                         onApply = {
-                            val idle = idleInput.toULongOrNull() ?: 0UL
-                            val sleep = sleepInput.toULongOrNull() ?: 0UL
+                            val tail = tailInput.toULongOrNull() ?: 8UL
+                            val idle = idleInput.toULongOrNull() ?: 4UL
                             onSaveConfig(
                                 config.copy(
+                                    radioTailSecs = tail,
                                     idleThresholdSecs = idle,
-                                    offlineSleepSecs = sleep,
+                                    offlineSleepSecs = maxOf(config.offlineSleepSecs, idle),
                                     pingUrl = pingUrlInput.trim(),
-                                    rootRecoveryEnabled = rootEnabledInput
+                                    rootRecoveryEnabled = rootEnabledInput,
+                                    liveOnCharging = liveChargingInput
                                 )
                             )
                         }
@@ -373,8 +409,13 @@ private fun FloatingPillNavBar(
 @Composable
 private fun MainTabContent(
     telemetry: TelemetrySnapshot,
+    profile: StabilizerProfile,
     isBatteryExempt: Boolean,
+    boostRemainingMinutes: Int,
     onToggleRunning: () -> Unit,
+    onSelectProfile: (StabilizerProfile) -> Unit,
+    onToggleBoost: () -> Unit,
+    onProbeNow: () -> Unit,
     onRequestBatteryExemption: () -> Unit
 ) {
     Column(
@@ -391,10 +432,17 @@ private fun MainTabContent(
 
         ControlStatusCard(
             telemetry = telemetry,
-            onToggleRunning = onToggleRunning
+            profile = profile,
+            boostRemainingMinutes = boostRemainingMinutes,
+            onToggleRunning = onToggleRunning,
+            onSelectProfile = onSelectProfile,
+            onToggleBoost = onToggleBoost,
+            onProbeNow = onProbeNow
         )
 
         TelemetryMetricsRow(telemetry = telemetry)
+
+        DailyEfficiencyCard(telemetry = telemetry)
     }
 }
 
@@ -402,7 +450,12 @@ private fun MainTabContent(
 @Composable
 private fun ControlStatusCard(
     telemetry: TelemetrySnapshot,
-    onToggleRunning: () -> Unit
+    profile: StabilizerProfile,
+    boostRemainingMinutes: Int,
+    onToggleRunning: () -> Unit,
+    onSelectProfile: (StabilizerProfile) -> Unit,
+    onToggleBoost: () -> Unit,
+    onProbeNow: () -> Unit
 ) {
     val (badgeBg, badgeFg, stateTitle) = stateVisuals(telemetry.state)
     val animatedBg by animateColorAsState(
@@ -442,7 +495,7 @@ private fun ControlStatusCard(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(18.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
+            verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -504,10 +557,69 @@ private fun ControlStatusCard(
             }
 
             Text(
-                text = stateDescription(telemetry.state, telemetry.isTethering),
+                text = telemetry.stateReason.ifBlank { stateDescription(telemetry.state, telemetry.isTethering) },
                 style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
+                color = MaterialTheme.colorScheme.onSurface
             )
+
+            // Quick Profile Selector + 30m Live Boost + Manual Probe
+            FlowRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                StabilizerProfile.entries.forEach { entry ->
+                    val label = when (entry) {
+                        StabilizerProfile.AUTO -> "Auto"
+                        StabilizerProfile.ECO -> "Eco"
+                        StabilizerProfile.LIVE -> "Live"
+                    }
+                    FilterChip(
+                        selected = profile == entry,
+                        onClick = { onSelectProfile(entry) },
+                        label = { Text(label) },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
+                            selectedLabelColor = MaterialTheme.colorScheme.onPrimaryContainer
+                        )
+                    )
+                }
+
+                FilterChip(
+                    selected = boostRemainingMinutes > 0,
+                    onClick = onToggleBoost,
+                    leadingIcon = {
+                        Icon(
+                            imageVector = Icons.Rounded.Bolt,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    },
+                    label = {
+                        Text(
+                            if (boostRemainingMinutes > 0) "Boost ${boostRemainingMinutes}m" else "Boost 30m"
+                        )
+                    },
+                    colors = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = MaterialTheme.colorScheme.tertiaryContainer,
+                        selectedLabelColor = MaterialTheme.colorScheme.onTertiaryContainer
+                    )
+                )
+
+                OutlinedButton(
+                    onClick = onProbeNow,
+                    shape = CircleShape,
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.NetworkCheck,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Probe", style = MaterialTheme.typography.labelMedium)
+                }
+            }
 
             FlowRow(
                 modifier = Modifier.fillMaxWidth(),
@@ -524,8 +636,20 @@ private fun ControlStatusCard(
                     icon = Icons.Rounded.Bolt,
                     highlighted = telemetry.isValidated
                 )
+                if (telemetry.isWifiDefault) {
+                    StatusChip(
+                        text = "Wi-Fi Default",
+                        icon = Icons.Rounded.Wifi,
+                        highlighted = true
+                    )
+                }
+                val clients = telemetry.hotspotClients.toInt()
                 StatusChip(
-                    text = if (telemetry.isTethering) "Tethering Active" else "Tethering Off",
+                    text = when {
+                        clients > 0 -> "Hotspot ($clients clients)"
+                        telemetry.isTethering -> "USB/BT Tether"
+                        else -> "Tethering Off"
+                    },
                     icon = Icons.Rounded.WifiTethering,
                     highlighted = telemetry.isTethering,
                     accentColor = MaterialTheme.colorScheme.tertiaryContainer,
@@ -587,22 +711,73 @@ private fun TelemetryMetricsRow(telemetry: TelemetrySnapshot) {
         horizontalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         MetricCard(
-            label = "Last Latency",
+            label = "Last RTT",
             value = telemetry.lastPingLatencyMs?.let { "${it} ms" } ?: "-- ms",
-            subtext = "HEAD probe",
-            modifier = Modifier.weight(1f)
-        )
-        MetricCard(
-            label = "Total Pings",
-            value = telemetry.totalPings.toString(),
             subtext = "${telemetry.successfulPings} ok / ${telemetry.failedPings} err",
             modifier = Modifier.weight(1f)
         )
         MetricCard(
-            label = "User Traffic",
-            value = formatBytesPerSec(telemetry.lastTrafficBytesPerSec),
-            subtext = "Excludes self",
+            label = "Probes Saved",
+            value = telemetry.avoidedFixed4sPings.toString(),
+            subtext = "${telemetry.totalPings} sent",
             modifier = Modifier.weight(1f)
+        )
+        MetricCard(
+            label = "RX / TX",
+            value = formatBytesPerSec(telemetry.lastRxBytesPerSec),
+            subtext = "TX ${formatBytesPerSec(telemetry.lastTxBytesPerSec)}",
+            modifier = Modifier.weight(1f)
+        )
+    }
+}
+
+@Composable
+private fun DailyEfficiencyCard(telemetry: TelemetrySnapshot) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(22.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainer
+        ),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Text(
+                text = "Session Efficiency & Healing",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                MiniStat("Probe Bytes", formatBytesTotal(telemetry.totalProbeBytes))
+                MiniStat("Stalls Healed", "${telemetry.stallsHealed}/${telemetry.stallsDetected}")
+                MiniStat("Recoveries", telemetry.recoveriesTriggered.toString())
+                MiniStat("Poll Rate", "${telemetry.recommendedSampleMs / 1000UL}s")
+            }
+        }
+    }
+}
+
+@Composable
+private fun MiniStat(label: String, value: String) {
+    Column(horizontalAlignment = Alignment.Start) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.onSurface
         )
     }
 }
@@ -740,7 +915,7 @@ private fun LogsTabContent(
                 border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
             ) {
                 Text(
-                    text = "No events yet. Start the stabilizer from the Main tab to record pings, traffic, and state transitions.",
+                    text = "No events yet. Start the stabilizer from the Main tab to record probes, stalls, and state transitions.",
                     modifier = Modifier.padding(18.dp),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -817,17 +992,27 @@ private fun LogEntryCard(entry: LogEntry) {
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun SettingsTabContent(
+    profile: StabilizerProfile,
+    onSelectProfile: (StabilizerProfile) -> Unit,
+    tailInput: String,
+    onTailChange: (String) -> Unit,
     idleInput: String,
     onIdleChange: (String) -> Unit,
-    sleepInput: String,
-    onSleepChange: (String) -> Unit,
     pingUrlInput: String,
     onPingUrlChange: (String) -> Unit,
     rootEnabled: Boolean,
     onRootEnabledChange: (Boolean) -> Unit,
+    liveOnCharging: Boolean,
+    onLiveOnChargingChange: (Boolean) -> Unit,
+    isCalibrating: Boolean,
+    calibrationSummary: String?,
+    rootTestStatus: String?,
     isBatteryExempt: Boolean,
+    onCalibrateTail: () -> Unit,
+    onTestRoot: () -> Unit,
     onRequestBatteryExemption: () -> Unit,
     onApply: () -> Unit
 ) {
@@ -839,6 +1024,72 @@ private fun SettingsTabContent(
             .padding(top = 8.dp, bottom = 108.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
+        // Carrier Radio Tail Calibration Card
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(24.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceContainer
+            ),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(18.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Carrier Radio Tail Calibration",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            text = "Tests 3s, 6s, 10s, 15s, 30s, 60s idle gaps to measure your carrier's RRC sleep threshold.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    FilledTonalButton(
+                        onClick = onCalibrateTail,
+                        enabled = !isCalibrating,
+                        shape = CircleShape
+                    ) {
+                        if (isCalibrating) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                strokeWidth = 2.dp
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Running")
+                        } else {
+                            Icon(
+                                imageVector = Icons.Rounded.Speed,
+                                contentDescription = null,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Calibrate")
+                        }
+                    }
+                }
+                if (!calibrationSummary.isNullOrBlank()) {
+                    Text(
+                        text = calibrationSummary,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+            }
+        }
+
         Card(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(24.dp),
@@ -854,27 +1105,40 @@ private fun SettingsTabContent(
                 verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
                 Text(
-                    text = "Probe & Timing Thresholds",
+                    text = "Profile & Probe Parameters",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.SemiBold
                 )
+
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    StabilizerProfile.entries.forEach { entry ->
+                        FilterChip(
+                            selected = profile == entry,
+                            onClick = { onSelectProfile(entry) },
+                            label = { Text(entry.name.lowercase().replaceFirstChar { it.uppercase() }) }
+                        )
+                    }
+                }
 
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     OutlinedTextField(
-                        value = idleInput,
-                        onValueChange = onIdleChange,
-                        label = { Text("Idle threshold (s)") },
+                        value = tailInput,
+                        onValueChange = onTailChange,
+                        label = { Text("Radio tail (4-20s)") },
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                         singleLine = true,
                         modifier = Modifier.weight(1f)
                     )
                     OutlinedTextField(
-                        value = sleepInput,
-                        onValueChange = onSleepChange,
-                        label = { Text("Offline sleep (s)") },
+                        value = idleInput,
+                        onValueChange = onIdleChange,
+                        label = { Text("Active exit (s)") },
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                         singleLine = true,
                         modifier = Modifier.weight(1f)
@@ -884,10 +1148,36 @@ private fun SettingsTabContent(
                 OutlinedTextField(
                     value = pingUrlInput,
                     onValueChange = onPingUrlChange,
-                    label = { Text("HEAD probe URL") },
+                    label = { Text("L2 HEAD probe URL") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Live while charging",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Medium
+                        )
+                        Text(
+                            text = "Allow Live keepalives in Auto mode while plugged in with screen on.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = liveOnCharging,
+                        onCheckedChange = {
+                            onLiveOnChargingChange(it)
+                            onApply()
+                        }
+                    )
+                }
 
                 Button(
                     onClick = onApply,
@@ -907,37 +1197,69 @@ private fun SettingsTabContent(
             ),
             border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
         ) {
-            Row(
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(18.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+                verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Column(
-                    modifier = Modifier
-                        .weight(1f)
-                        .padding(end = 12.dp)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(
-                        text = "Root Auto-Recovery",
-                        style = MaterialTheme.typography.titleSmall,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "Runs su svc data disable/enable if cellular stays unvalidated for 10s while active.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(end = 12.dp)
+                    ) {
+                        Text(
+                            text = "Root Auto-Recovery",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "Fallback after Android re-validation (rate-limited: 2m cooldown, max 3/15m, paused during calls).",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = rootEnabled,
+                        onCheckedChange = {
+                            onRootEnabledChange(it)
+                            onApply()
+                        }
                     )
                 }
-                Switch(
-                    checked = rootEnabled,
-                    onCheckedChange = {
-                        onRootEnabledChange(it)
-                        onApply()
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = rootTestStatus ?: "Tap Test Root to trigger Magisk/su prompt immediately.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(end = 12.dp)
+                    )
+                    FilledTonalButton(
+                        onClick = onTestRoot,
+                        shape = CircleShape
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Security,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Test Root")
                     }
-                )
+                }
             }
         }
 
@@ -971,7 +1293,7 @@ private fun SettingsTabContent(
                         text = if (isBatteryExempt) {
                             "Unrestricted background execution is enabled."
                         } else {
-                            "Exempt this app so Doze does not pause keepalive monitoring."
+                            "Exempt this app so stall checks and foreground service stay reliable."
                         },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -1020,7 +1342,7 @@ private fun BatteryOptimizationCard(
                     color = MaterialTheme.colorScheme.onTertiaryContainer
                 )
                 Text(
-                    text = "Prevents Doze from pausing cellular monitoring.",
+                    text = "Prevents aggressive OEM background kills.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onTertiaryContainer
                 )
@@ -1043,25 +1365,35 @@ private fun stateVisuals(state: StabilizerState): Triple<Color, Color, String> {
             MaterialTheme.colorScheme.onTertiaryContainer,
             "ACTIVE"
         )
-        StabilizerState.IDLE_PING -> Triple(
+        StabilizerState.LIVE_KEEPALIVE -> Triple(
             MaterialTheme.colorScheme.primaryContainer,
             MaterialTheme.colorScheme.onPrimaryContainer,
-            "IDLE PING"
+            "LIVE"
+        )
+        StabilizerState.ECO_TAIL_CHECK -> Triple(
+            MaterialTheme.colorScheme.secondaryContainer,
+            MaterialTheme.colorScheme.onSecondaryContainer,
+            "ECO TAIL"
         )
         StabilizerState.WARMUP -> Triple(
             MaterialTheme.colorScheme.secondaryContainer,
             MaterialTheme.colorScheme.onSecondaryContainer,
             "WARMUP"
         )
-        StabilizerState.SLEEPING -> Triple(
+        StabilizerState.QUIET -> Triple(
             MaterialTheme.colorScheme.surfaceContainerHighest,
             MaterialTheme.colorScheme.onSurfaceVariant,
-            "SLEEPING"
+            "QUIET"
         )
         StabilizerState.RECOVERING -> Triple(
             MaterialTheme.colorScheme.errorContainer,
             MaterialTheme.colorScheme.onErrorContainer,
             "RECOVERING"
+        )
+        StabilizerState.OUTAGE -> Triple(
+            MaterialTheme.colorScheme.errorContainer,
+            MaterialTheme.colorScheme.onErrorContainer,
+            "OUTAGE"
         )
         StabilizerState.STOPPED -> Triple(
             MaterialTheme.colorScheme.surfaceContainerHighest,
@@ -1073,19 +1405,17 @@ private fun stateVisuals(state: StabilizerState): Triple<Color, Color, String> {
 
 private fun stateDescription(state: StabilizerState, isTethering: Boolean): String {
     return when (state) {
-        StabilizerState.ACTIVE -> if (isTethering) {
-            "Tethered/mobile traffic is moving. Sending 0 keepalive pings."
+        StabilizerState.ACTIVE -> "Real RX traffic moving. 0 probes sent."
+        StabilizerState.ECO_TAIL_CHECK -> "Brief post-traffic confirmation inside carrier tail window."
+        StabilizerState.QUIET -> "0 pings standby; wakes instantly on traffic, TX stalls, or radio events."
+        StabilizerState.LIVE_KEEPALIVE -> if (isTethering) {
+            "Hotspot/USB clients active; keeping modem tail warm."
         } else {
-            "Real mobile traffic is moving. Sending 0 keepalive pings."
+            "Live keepalive keeping modem inside carrier RRC tail."
         }
-        StabilizerState.IDLE_PING -> if (isTethering) {
-            "Tethering active and traffic quiet; sending 1 lightweight HEAD probe per idle window."
-        } else {
-            "Traffic is idle past threshold. Sending 1 lightweight HEAD probe per idle window."
-        }
-        StabilizerState.WARMUP -> "Link woke up. Warming cellular radio with 1 instant HEAD ping."
-        StabilizerState.SLEEPING -> "Zero-ping sleep mode (screen off or offline app). Resumes on real traffic, tethering, or screen wake."
-        StabilizerState.RECOVERING -> "NET_CAPABILITY_VALIDATED lost while active. Probing link recovery."
+        StabilizerState.WARMUP -> "Link woke up; verifying cellular path."
+        StabilizerState.RECOVERING -> "Healing silent stall or unvalidated cellular link."
+        StabilizerState.OUTAGE -> "Carrier outage detected; backing off exponentially."
         StabilizerState.STOPPED -> "Stabilizer service is stopped."
     }
 }
@@ -1099,10 +1429,19 @@ private fun formatBytesPerSec(bytesPerSec: ULong): String {
     }
 }
 
+private fun formatBytesTotal(totalBytes: ULong): String {
+    val bytes = totalBytes.toLong()
+    return when {
+        bytes < 1024L -> "$bytes B"
+        bytes < 1024L * 1024L -> String.format(Locale.US, "%.1f KB", bytes / 1024.0)
+        else -> String.format(Locale.US, "%.2f MB", bytes / (1024.0 * 1024.0))
+    }
+}
+
 fun formatLogsForExport(logs: List<LogEntry>): String {
     val formatter = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
     return buildString {
-        appendLine("Stabilizer-NaNo Telemetry Logs")
+        appendLine("Stabilizer-NaNo V2 Telemetry Logs")
         appendLine("Exported: ${formatter.format(Date())}")
         appendLine("Entries: ${logs.size}")
         appendLine("----------------------------------------")
