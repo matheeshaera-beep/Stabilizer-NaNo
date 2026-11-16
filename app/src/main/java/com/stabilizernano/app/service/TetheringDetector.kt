@@ -2,12 +2,11 @@ package com.stabilizernano.app.service
 
 import android.content.Context
 import android.net.ConnectivityManager
-import android.net.wifi.SoftApConfiguration
-import android.net.wifi.WifiClient
 import android.net.wifi.WifiManager
-import android.os.Build
 import java.io.File
+import java.lang.reflect.Proxy
 import java.net.NetworkInterface
+import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -31,47 +30,53 @@ class TetheringDetector(context: Context) {
         appContext.getSystemService(WifiManager::class.java)
 
     private val softApClientCount = AtomicInteger(-1)
-    private var softApCallbackRegistered = false
+    private var softApCallbackProxy: Any? = null
     private val callbackExecutor = Executors.newSingleThreadExecutor()
 
-    private val softApCallback: Any? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-        object : WifiManager.SoftApCallback {
-            override fun onStateChanged(state: Int, failureReason: Int) {
-                if (state != WIFI_AP_STATE_ENABLED) {
-                    softApClientCount.set(0)
-                }
-            }
-
-            override fun onConnectedClientsChanged(clients: List<WifiClient>) {
-                softApClientCount.set(clients.size)
-            }
-
-            override fun onConnectedClientsChanged(info: android.net.wifi.SoftApInfo, clients: List<WifiClient>) {
-                softApClientCount.set(clients.size)
-            }
-        }
-    } else {
-        null
-    }
-
     fun registerCallbacks() {
-        if (softApCallbackRegistered || Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+        if (softApCallbackProxy != null) return
         val manager = wifiManager ?: return
-        val cb = softApCallback as? WifiManager.SoftApCallback ?: return
         runCatching {
-            manager.registerSoftApCallback(callbackExecutor, cb)
-            softApCallbackRegistered = true
+            val cbInterface = Class.forName("android.net.wifi.WifiManager\$SoftApCallback")
+            val proxy = Proxy.newProxyInstance(
+                cbInterface.classLoader,
+                arrayOf(cbInterface)
+            ) { _, method, args ->
+                when (method.name) {
+                    "onConnectedClientsChanged" -> {
+                        val clients = args?.lastOrNull() as? Collection<*>
+                        if (clients != null) {
+                            softApClientCount.set(clients.size)
+                        }
+                    }
+                    "onStateChanged" -> {
+                        val state = args?.firstOrNull() as? Int
+                        if (state != WIFI_AP_STATE_ENABLED) {
+                            softApClientCount.set(0)
+                        }
+                    }
+                }
+                null
+            }
+            val regMethod = manager.javaClass.getMethod(
+                "registerSoftApCallback",
+                Executor::class.java,
+                cbInterface
+            )
+            regMethod.invoke(manager, callbackExecutor, proxy)
+            softApCallbackProxy = proxy
         }
     }
 
     fun unregisterCallbacks() {
-        if (!softApCallbackRegistered || Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+        val proxy = softApCallbackProxy ?: return
         val manager = wifiManager ?: return
-        val cb = softApCallback as? WifiManager.SoftApCallback ?: return
         runCatching {
-            manager.unregisterSoftApCallback(cb)
+            val cbInterface = Class.forName("android.net.wifi.WifiManager\$SoftApCallback")
+            val unregMethod = manager.javaClass.getMethod("unregisterSoftApCallback", cbInterface)
+            unregMethod.invoke(manager, proxy)
         }
-        softApCallbackRegistered = false
+        softApCallbackProxy = null
         softApClientCount.set(-1)
     }
 
@@ -133,10 +138,11 @@ class TetheringDetector(context: Context) {
 
     private fun countNeighborClients(interfaces: Set<String>): Int {
         if (interfaces.isEmpty()) return 0
-        // Fallback: inspect kernel ARP table entries associated with hotspot interfaces.
-        return runCatching {
+
+        // Strategy 1: /proc/net/arp (fast, zero subprocess overhead where readable).
+        val arpCount = runCatching {
             val arpFile = File("/proc/net/arp")
-            if (!arpFile.canRead()) return@runCatching 0
+            if (!arpFile.canRead()) return@runCatching -1
             arpFile.readLines()
                 .drop(1)
                 .count { line ->
@@ -149,6 +155,23 @@ class TetheringDetector(context: Context) {
                         hwAddr != "00:00:00:00:00:00" &&
                         (interfaces.contains(iface) || isHotspotInterface(iface))
                 }
+        }.getOrDefault(-1)
+        if (arpCount >= 0) return arpCount
+
+        // Strategy 2: `ip -4 neigh show` fallback on Android 10+ where /proc/net/arp is restricted.
+        return runCatching {
+            val process = ProcessBuilder("ip", "-4", "neigh", "show")
+                .redirectErrorStream(true)
+                .start()
+            val lines = process.inputStream.bufferedReader().use { it.readLines() }
+            process.waitFor()
+            lines.count { line ->
+                val activeState = line.contains("REACHABLE") ||
+                    line.contains("STALE") ||
+                    line.contains("DELAY")
+                val matchesHotspot = interfaces.any { iface -> line.contains(" dev $iface ") }
+                activeState && matchesHotspot
+            }
         }.getOrDefault(0)
     }
 
