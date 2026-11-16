@@ -10,6 +10,7 @@ import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
@@ -23,11 +24,23 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.lifecycleScope
 import com.stabilizernano.app.data.StabilizerRepository
 import com.stabilizernano.app.ui.StabilizerScreen
+import com.stabilizernano.app.ui.formatLogsForExport
 import com.stabilizernano.app.ui.theme.StabilizerTheme
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class MainActivity : ComponentActivity() {
+
+    private var pendingExportContent: String? = null
+    private val statusNotice = MutableStateFlow<String?>(null)
 
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -35,9 +48,40 @@ class MainActivity : ComponentActivity() {
         StabilizerRepository.startService(this)
     }
 
+    private val createLogFileLauncher = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("text/plain")
+    ) { uri ->
+        val content = pendingExportContent
+        pendingExportContent = null
+        if (uri == null || content == null) return@registerForActivityResult
+
+        lifecycleScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    contentResolver.openOutputStream(uri)?.bufferedWriter(Charsets.UTF_8)?.use {
+                        it.write(content)
+                    } ?: error("Unable to open destination file")
+                }
+            }
+            statusNotice.value = result.fold(
+                onSuccess = { "Saved telemetry logs to file" },
+                onFailure = { err -> "Failed to save logs: ${err.message}" }
+            )
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.auto(
+                android.graphics.Color.TRANSPARENT,
+                android.graphics.Color.TRANSPARENT
+            ),
+            navigationBarStyle = SystemBarStyle.auto(
+                android.graphics.Color.TRANSPARENT,
+                android.graphics.Color.TRANSPARENT
+            )
+        )
         StabilizerRepository.ensureInitialized(applicationContext)
 
         setContent {
@@ -46,6 +90,7 @@ class MainActivity : ComponentActivity() {
                 val config by StabilizerRepository.config.collectAsStateWithLifecycle()
                 val localLogs by StabilizerRepository.localLogs.collectAsStateWithLifecycle()
                 val errorBanner by StabilizerRepository.errorBanner.collectAsStateWithLifecycle()
+                val uiNotice by statusNotice.collectAsStateWithLifecycle()
 
                 var isBatteryExempt by remember { mutableStateOf(checkBatteryOptimizationExempt()) }
                 val lifecycleOwner = LocalLifecycleOwner.current
@@ -65,14 +110,35 @@ class MainActivity : ComponentActivity() {
                     telemetry = telemetry,
                     config = config,
                     localLogs = localLogs,
-                    errorBanner = errorBanner,
+                    errorBanner = errorBanner ?: uiNotice,
                     isBatteryExempt = isBatteryExempt,
                     onToggleRunning = { handleToggleService(telemetry.isRunning) },
                     onSaveConfig = { newConfig ->
-                        StabilizerRepository.updateConfig(applicationContext, newConfig)
+                        val res = StabilizerRepository.updateConfig(applicationContext, newConfig)
+                        if (res.isSuccess) {
+                            statusNotice.value = "Settings saved and applied"
+                        }
                     },
+                    onClearLogs = {
+                        StabilizerRepository.clearLogs()
+                        statusNotice.value = "Logs cleared"
+                    },
+                    onExportLogsFile = { logsToExport ->
+                        if (logsToExport.isEmpty()) {
+                            statusNotice.value = "No logs available to export"
+                        } else {
+                            pendingExportContent = formatLogsForExport(logsToExport)
+                            val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US)
+                                .format(Date())
+                            createLogFileLauncher.launch("stabilizer-nano-logs-$stamp.txt")
+                        }
+                    },
+                    onShowNotice = { msg -> statusNotice.value = msg },
                     onRequestBatteryExemption = { requestBatteryOptimizationExemption() },
-                    onDismissError = { StabilizerRepository.clearErrorBanner() }
+                    onDismissError = {
+                        StabilizerRepository.clearErrorBanner()
+                        statusNotice.value = null
+                    }
                 )
             }
         }

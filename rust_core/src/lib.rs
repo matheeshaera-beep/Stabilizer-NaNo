@@ -38,6 +38,7 @@ pub struct TelemetrySnapshot {
     pub has_internet_capability: bool,
     pub is_validated: bool,
     pub is_screen_on: bool,
+    pub is_tethering: bool,
     pub logs: Vec<LogEntry>,
 }
 
@@ -109,6 +110,7 @@ impl EngineInner {
             has_internet_capability: self.sm.has_internet(),
             is_validated: self.sm.is_validated(),
             is_screen_on: self.sm.is_screen_on(),
+            is_tethering: self.sm.is_tethering(),
             logs: self.logs.iter().cloned().collect(),
         }
     }
@@ -244,6 +246,11 @@ impl StabilizerEngine {
         );
     }
 
+    /// Updates Hotspot / USB / Bluetooth tethering state from Android.
+    pub fn on_tethering_state_changed(&self, is_tethering: bool) {
+        self.dispatch_event(Event::TetheringChanged { is_tethering }, true);
+    }
+
     /// Feeds the 1-second external mobile traffic delta (after subtracting own UID bytes).
     pub fn on_traffic_sample(&self, external_mobile_bytes_delta: u64) {
         self.dispatch_event(
@@ -252,6 +259,19 @@ impl StabilizerEngine {
             },
             false,
         );
+    }
+
+    /// Clears stored telemetry logs and notifies observers.
+    pub fn clear_logs(&self) {
+        let snapshot = {
+            let mut guard = match self.inner.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            guard.logs.clear();
+            guard.snapshot()
+        };
+        self.observer.on_telemetry_updated(snapshot);
     }
 
     /// Returns the latest telemetry snapshot synchronously.

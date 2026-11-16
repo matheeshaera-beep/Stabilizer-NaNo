@@ -45,6 +45,7 @@ class StabilizerForegroundService : Service() {
     private lateinit var engine: StabilizerEngine
     private lateinit var notificationManager: NotificationManager
     private lateinit var connectivityManager: ConnectivityManager
+    private lateinit var tetheringDetector: TetheringDetector
 
     private val cellularNetworks = ConcurrentHashMap<Network, Pair<Boolean, Boolean>>()
     private var listenersRegistered = false
@@ -88,6 +89,7 @@ class StabilizerForegroundService : Service() {
         super.onCreate()
         notificationManager = getSystemService(NotificationManager::class.java)
         connectivityManager = getSystemService(ConnectivityManager::class.java)
+        tetheringDetector = TetheringDetector(applicationContext)
         engine = StabilizerRepository.ensureInitialized(applicationContext)
         createNotificationChannel()
     }
@@ -181,6 +183,9 @@ class StabilizerForegroundService : Service() {
             }
         }
         dispatchAggregatedNetworkState()
+
+        val initialTether = tetheringDetector.inspect()
+        engine.onTetheringStateChanged(initialTether.isTethering)
     }
 
     private fun updateNetworkEntry(network: Network, caps: NetworkCapabilities?) {
@@ -207,11 +212,30 @@ class StabilizerForegroundService : Service() {
         trafficJob = serviceScope.launch {
             var prevMobileBytes = readTotalMobileBytes()
             var prevOwnUidBytes = readUidTotalBytes(uid)
+            val initialTether = tetheringDetector.inspect()
+            var prevTetheringActive = initialTether.isTethering
+            var prevTetherBytes = if (initialTether.isTethering) {
+                tetheringDetector.readInterfaceTotalBytes(initialTether.activeInterfaces)
+            } else {
+                null
+            }
 
             while (isActive) {
                 delay(1_000L)
                 val currMobileBytes = readTotalMobileBytes()
                 val currOwnUidBytes = readUidTotalBytes(uid)
+                val tetherStatus = tetheringDetector.inspect()
+
+                if (tetherStatus.isTethering != prevTetheringActive) {
+                    prevTetheringActive = tetherStatus.isTethering
+                    engine.onTetheringStateChanged(tetherStatus.isTethering)
+                }
+
+                val currTetherBytes = if (tetherStatus.isTethering) {
+                    tetheringDetector.readInterfaceTotalBytes(tetherStatus.activeInterfaces)
+                } else {
+                    null
+                }
 
                 val mobileDelta = if (prevMobileBytes >= 0L && currMobileBytes >= prevMobileBytes) {
                     currMobileBytes - prevMobileBytes
@@ -223,12 +247,28 @@ class StabilizerForegroundService : Service() {
                 } else {
                     0L
                 }
+                val tetherDelta = if (
+                    prevTetherBytes != null &&
+                    currTetherBytes != null &&
+                    currTetherBytes >= prevTetherBytes
+                ) {
+                    currTetherBytes - prevTetherBytes
+                } else {
+                    0L
+                }
 
                 prevMobileBytes = currMobileBytes
                 prevOwnUidBytes = currOwnUidBytes
+                prevTetherBytes = currTetherBytes
 
-                // Subtract our own UID traffic so stabilizer HEAD pings never count as real traffic.
-                val externalMobileDelta = (mobileDelta - ownUidDelta).coerceAtLeast(0L)
+                // Subtract our own UID traffic so stabilizer HEAD pings never count as real traffic,
+                // while accounting for tethered device traffic even when hardware-offloaded.
+                val baseExternalDelta = (mobileDelta - ownUidDelta).coerceAtLeast(0L)
+                val externalMobileDelta = if (tetherStatus.isTethering) {
+                    maxOf(baseExternalDelta, tetherDelta)
+                } else {
+                    baseExternalDelta
+                }
                 engine.onTrafficSample(externalMobileDelta.toULong())
             }
         }
@@ -238,7 +278,9 @@ class StabilizerForegroundService : Service() {
         if (notificationJob?.isActive == true) return
         notificationJob = serviceScope.launch {
             StabilizerRepository.telemetry
-                .distinctUntilChangedBy { Triple(it.state, it.lastPingLatencyMs, it.totalPings) }
+                .distinctUntilChangedBy {
+                    listOf(it.state, it.lastPingLatencyMs, it.totalPings, it.isTethering)
+                }
                 .collectLatest { snapshot ->
                     if (snapshot.isRunning) {
                         notificationManager.notify(NOTIFICATION_ID, buildNotification(snapshot))
@@ -288,8 +330,9 @@ class StabilizerForegroundService : Service() {
             StabilizerState.RECOVERING -> "Recovering"
             StabilizerState.STOPPED -> "Starting..."
         }
+        val tetherPart = if (snapshot.isTethering) " • Tethering" else ""
         val latencyPart = snapshot.lastPingLatencyMs?.let { " • ${it}ms" } ?: ""
-        val contentText = "$stateLabel$latencyPart • ${snapshot.totalPings} pings"
+        val contentText = "$stateLabel$tetherPart$latencyPart • ${snapshot.totalPings} pings"
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stabilizer_tile)

@@ -57,6 +57,7 @@ object StabilizerRepository : StabilizerObserver {
             hasInternetCapability = false,
             isValidated = false,
             isScreenOn = true,
+            isTethering = false,
             logs = emptyList()
         )
     )
@@ -109,6 +110,11 @@ object StabilizerRepository : StabilizerObserver {
         } else {
             startService(context)
         }
+    }
+
+    fun clearLogs() {
+        _localLogs.value = emptyList()
+        engine?.clearLogs()
     }
 
     fun updateConfig(context: Context, newConfig: StabilizerConfig): Result<Unit> {
