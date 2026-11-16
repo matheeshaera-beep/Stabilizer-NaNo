@@ -30,6 +30,7 @@ interface CellularNetworkDelegate {
     fun bindCellularSocketFd(fd: Int): Boolean
     fun requestAndroidRevalidation()
     fun onBoostStateUpdated(active: Boolean)
+    fun wakeSampler()
 }
 
 object StabilizerRepository : StabilizerObserver {
@@ -223,11 +224,16 @@ object StabilizerRepository : StabilizerObserver {
 
     fun updateConfig(context: Context, newConfig: StabilizerConfig): Result<Unit> {
         val instance = ensureInitialized(context)
+        if (_config.value == newConfig) {
+            _errorBanner.value = null
+            return Result.success(Unit)
+        }
         return try {
             instance.updateConfig(newConfig)
             preferences?.saveConfig(newConfig)
             _config.value = newConfig
             _errorBanner.value = null
+            networkDelegate?.wakeSampler()
             Result.success(Unit)
         } catch (ex: StabilizerException) {
             val msg = ex.message ?: "Invalid stabilizer configuration"

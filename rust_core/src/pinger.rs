@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,8 +15,11 @@ use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::time::{timeout, Instant};
 use tokio_rustls::TlsConnector;
 
-const L1_TIMEOUT: Duration = Duration::from_secs(3);
-const L2_TIMEOUT: Duration = Duration::from_secs(6);
+const L1_DNS_TIMEOUT: Duration = Duration::from_millis(1_500);
+const L1_TCP_TIMEOUT: Duration = Duration::from_secs(3);
+const L2_TIMEOUT: Duration = Duration::from_secs(10);
+const DNS_CACHE_TTL: Duration = Duration::from_secs(300);
+const UDP_BYPASS_PROBES: u8 = 20;
 const DEFAULT_DNS_TARGETS: [SocketAddr; 2] = [
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
@@ -53,6 +57,8 @@ pub struct CellularPinger {
     next_tx_id: Arc<AtomicU16>,
     rr_counter: Arc<AtomicUsize>,
     rtt_ewma_ms: Arc<Mutex<[Option<u64>; 2]>>,
+    udp_bypass_remaining: Arc<AtomicU8>,
+    dns_cache: Arc<Mutex<HashMap<String, (IpAddr, Instant)>>>,
 }
 
 impl std::fmt::Debug for CellularPinger {
@@ -80,6 +86,8 @@ impl CellularPinger {
             next_tx_id: Arc::new(AtomicU16::new(0x1337)),
             rr_counter: Arc::new(AtomicUsize::new(0)),
             rtt_ewma_ms: Arc::new(Mutex::new([None, None])),
+            udp_bypass_remaining: Arc::new(AtomicU8::new(0)),
+            dns_cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -92,10 +100,39 @@ impl CellularPinger {
     }
 
     /// Sends an ultra-cheap L1 UDP DNS query to the fastest healthy target (`1.1.1.1` / `8.8.8.8`),
-    /// falling back to a cellular-bound TCP:443 handshake if UDP/53 is filtered.
+    /// falling back immediately to cellular-bound TCP:443 if UDP/53 is filtered by the carrier.
     pub async fn probe_l1(&self) -> Result<ProbeOutcome, String> {
         let idx = self.pick_target_index();
         let target = DEFAULT_DNS_TARGETS[idx];
+
+        let bypass_left = self.udp_bypass_remaining.load(Ordering::Relaxed);
+        if bypass_left > 0 {
+            self.udp_bypass_remaining
+                .store(bypass_left - 1, Ordering::Relaxed);
+            let tcp_target = SocketAddr::new(target.ip(), 443);
+            let started = Instant::now();
+            match timeout(L1_TCP_TIMEOUT, self.connect_cellular_tcp(tcp_target)).await {
+                Ok(Ok(_stream)) => {
+                    let rtt_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                    self.record_target_rtt(idx, rtt_ms);
+                    return Ok(ProbeOutcome {
+                        tier: ProbeTier::L1Dns,
+                        status_code: 0,
+                        latency_ms: rtt_ms,
+                        bytes_estimated: 300,
+                        target: format!("tcp://{tcp_target}"),
+                    });
+                }
+                Ok(Err(tcp_err)) => {
+                    self.udp_bypass_remaining.store(0, Ordering::Relaxed);
+                    return Err(format!("L1 TCP:443 failed ({tcp_target}): {tcp_err}"));
+                }
+                Err(_) => {
+                    self.udp_bypass_remaining.store(0, Ordering::Relaxed);
+                    return Err(format!("L1 TCP:443 timed out after 3s ({tcp_target})"));
+                }
+            }
+        }
 
         match self
             .udp_dns_ping(target, "connectivitycheck.gstatic.com")
@@ -112,6 +149,10 @@ impl CellularPinger {
                 })
             }
             Err(dns_err) => {
+                if dns_err.contains("cellular network unavailable") {
+                    return Err(dns_err);
+                }
+
                 // Rotate to second DNS server before falling back to TCP connect.
                 let alt_idx = (idx + 1) % DEFAULT_DNS_TARGETS.len();
                 let alt_target = DEFAULT_DNS_TARGETS[alt_idx];
@@ -129,16 +170,19 @@ impl CellularPinger {
                     });
                 }
 
-                // If carrier APN blocks external port 53 UDP, test raw TCP:443 SYN-ACK.
+                // Carrier APN likely blocks/drops port 53 UDP: fall back to TCP:443 SYN-ACK
+                // and bypass UDP/53 for the next `UDP_BYPASS_PROBES` checks so L1 finishes in ~15ms.
                 let tcp_target = SocketAddr::new(target.ip(), 443);
                 let started = Instant::now();
-                let _stream = timeout(L1_TIMEOUT, self.connect_cellular_tcp(tcp_target))
+                let _stream = timeout(L1_TCP_TIMEOUT, self.connect_cellular_tcp(tcp_target))
                     .await
                     .map_err(|_| format!("L1 DNS ({dns_err}) and TCP:443 timed out after 3s"))?
                     .map_err(|tcp_err| format!("L1 failed (DNS: {dns_err}; TCP: {tcp_err})"))?;
 
                 let rtt_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                 self.record_target_rtt(idx, rtt_ms);
+                self.udp_bypass_remaining
+                    .store(UDP_BYPASS_PROBES, Ordering::Relaxed);
                 Ok(ProbeOutcome {
                     tier: ProbeTier::L1Dns,
                     status_code: 0,
@@ -150,7 +194,7 @@ impl CellularPinger {
         }
     }
 
-    /// Sends one fresh cellular-bound HTTP/HTTPS `HEAD` probe to `url` with a 6s timeout.
+    /// Sends one fresh cellular-bound HTTP/HTTPS `HEAD` probe to `url` with a 10s congested timeout.
     pub async fn probe_l2_head(&self, url: &str) -> Result<ProbeOutcome, String> {
         let parsed = ParsedHttpUrl::parse(url)?;
         let started = Instant::now();
@@ -174,7 +218,13 @@ impl CellularPinger {
         started: Instant,
     ) -> Result<ProbeOutcome, String> {
         let addr = self.resolve_host(&parsed.host, parsed.port).await?;
-        let tcp = self.connect_cellular_tcp(addr).await?;
+        let tcp = match self.connect_cellular_tcp(addr).await {
+            Ok(s) => s,
+            Err(err) => {
+                self.invalidate_dns_cache(&parsed.host);
+                return Err(err);
+            }
+        };
 
         let req = format!(
             "HEAD {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Stabilizer-NaNo/0.2\r\nAccept: */*\r\nConnection: close\r\n\r\n",
@@ -229,29 +279,75 @@ impl CellularPinger {
             return Ok(SocketAddr::new(ip, port));
         }
 
-        // Resolve via cellular-bound UDP DNS so host lookups never leak onto Wi-Fi
-        // and our own DNS traffic stays inside our app UID for TrafficStats subtraction.
-        let dns_idx = self.pick_target_index();
-        let dns_server = DEFAULT_DNS_TARGETS[dns_idx];
-        match self.udp_dns_resolve_a(dns_server, host).await {
-            Ok(ip) => return Ok(SocketAddr::new(IpAddr::V4(ip), port)),
-            Err(err) if err.contains("cellular network unavailable") => return Err(err),
-            Err(_) => {}
-        }
-        let alt_server = DEFAULT_DNS_TARGETS[(dns_idx + 1) % DEFAULT_DNS_TARGETS.len()];
-        match self.udp_dns_resolve_a(alt_server, host).await {
-            Ok(ip) => return Ok(SocketAddr::new(IpAddr::V4(ip), port)),
-            Err(err) if err.contains("cellular network unavailable") => return Err(err),
-            Err(_) => {}
+        if let Some(ip) = self.cached_dns_ip(host) {
+            return Ok(SocketAddr::new(ip, port));
         }
 
-        // Fallback to OS resolver (for localhost / IPv6-only / local test hosts).
+        // Resolve via cellular-bound UDP DNS (1.5s cap) when UDP/53 is not bypassed
+        // so host lookups never leak onto Wi-Fi.
+        if self.udp_bypass_remaining.load(Ordering::Relaxed) == 0 {
+            let dns_idx = self.pick_target_index();
+            let dns_server = DEFAULT_DNS_TARGETS[dns_idx];
+            match self.udp_dns_resolve_a(dns_server, host).await {
+                Ok(ip) => {
+                    let ip_addr = IpAddr::V4(ip);
+                    self.store_dns_cache(host, ip_addr);
+                    return Ok(SocketAddr::new(ip_addr, port));
+                }
+                Err(err) if err.contains("cellular network unavailable") => return Err(err),
+                Err(_) => {}
+            }
+            let alt_server = DEFAULT_DNS_TARGETS[(dns_idx + 1) % DEFAULT_DNS_TARGETS.len()];
+            match self.udp_dns_resolve_a(alt_server, host).await {
+                Ok(ip) => {
+                    let ip_addr = IpAddr::V4(ip);
+                    self.store_dns_cache(host, ip_addr);
+                    return Ok(SocketAddr::new(ip_addr, port));
+                }
+                Err(err) if err.contains("cellular network unavailable") => return Err(err),
+                Err(_) => {}
+            }
+        }
+
+        // Fallback to OS resolver (used when UDP/53 is carrier-filtered, IPv6-only, or localhost).
         let mut addrs = tokio::net::lookup_host((host, port))
             .await
             .map_err(|err| format!("DNS resolution failed for {host}: {err}"))?;
-        addrs
+        let addr = addrs
             .next()
-            .ok_or_else(|| format!("DNS returned no addresses for {host}"))
+            .ok_or_else(|| format!("DNS returned no addresses for {host}"))?;
+        self.store_dns_cache(host, addr.ip());
+        Ok(addr)
+    }
+
+    fn cached_dns_ip(&self, host: &str) -> Option<IpAddr> {
+        let mut guard = match self.dns_cache.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if let Some(&(ip, cached_at)) = guard.get(host) {
+            if cached_at.elapsed() < DNS_CACHE_TTL {
+                return Some(ip);
+            }
+            guard.remove(host);
+        }
+        None
+    }
+
+    fn store_dns_cache(&self, host: &str, ip: IpAddr) {
+        let mut guard = match self.dns_cache.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        guard.insert(host.to_owned(), (ip, Instant::now()));
+    }
+
+    fn invalidate_dns_cache(&self, host: &str) {
+        let mut guard = match self.dns_cache.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        guard.remove(host);
     }
 
     async fn connect_cellular_tcp(&self, addr: SocketAddr) -> Result<TcpStream, String> {
@@ -309,7 +405,7 @@ impl CellularPinger {
             .map_err(|err| format!("UDP DNS send failed: {err}"))?;
 
         let mut buf = [0u8; 512];
-        let n = timeout(L1_TIMEOUT, sock.recv(&mut buf))
+        let n = timeout(L1_DNS_TIMEOUT, sock.recv(&mut buf))
             .await
             .map_err(|_| format!("DNS probe timeout ({server})"))?
             .map_err(|err| format!("UDP DNS recv failed: {err}"))?;
@@ -342,7 +438,7 @@ impl CellularPinger {
             .map_err(|err| format!("UDP send failed: {err}"))?;
 
         let mut buf = [0u8; 512];
-        let n = timeout(L1_TIMEOUT, sock.recv(&mut buf))
+        let n = timeout(L1_DNS_TIMEOUT, sock.recv(&mut buf))
             .await
             .map_err(|_| "DNS resolve timeout".to_owned())?
             .map_err(|err| format!("UDP recv failed: {err}"))?;

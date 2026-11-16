@@ -76,6 +76,7 @@ class StabilizerForegroundService : Service(), CellularNetworkDelegate {
     private var trafficJob: Job? = null
     private var notificationJob: Job? = null
     private var lastDispatchedContext: RuntimeContext? = null
+    private var lastDispatchedNetCaps: Pair<Boolean, Boolean>? = null
     private var lastInterfaceSignature: String? = null
     private var lastDisplayOverrideNetwork: Int? = null
     private var telephonyCallback: Any? = null
@@ -210,6 +211,10 @@ class StabilizerForegroundService : Service(), CellularNetworkDelegate {
         }
     }
 
+    override fun wakeSampler() {
+        samplerWakeSignal.trySend(Unit)
+    }
+
     private fun startMonitoring() {
         boostActiveFlag.set(StabilizerRepository.boostRemainingMinutes.value > 0)
         registerSystemListeners()
@@ -272,6 +277,8 @@ class StabilizerForegroundService : Service(), CellularNetworkDelegate {
         unregisterRadioEventListeners()
         cellularNetworks.clear()
         preferredCellularNetwork.set(null)
+        lastDispatchedContext = null
+        lastDispatchedNetCaps = null
         listenersRegistered = false
     }
 
@@ -403,7 +410,11 @@ class StabilizerForegroundService : Service(), CellularNetworkDelegate {
 
         val hasInternet = entries.any { it.value.first }
         val isValidated = entries.any { it.value.first && it.value.second }
-        engine.onNetworkCapabilitiesChanged(hasInternet = hasInternet, isValidated = isValidated)
+        val netCaps = hasInternet to isValidated
+        if (netCaps != lastDispatchedNetCaps) {
+            lastDispatchedNetCaps = netCaps
+            engine.onNetworkCapabilitiesChanged(hasInternet = hasInternet, isValidated = isValidated)
+        }
     }
 
     private fun pushContextIfChanged(tetherStatus: TetheringStatus) {

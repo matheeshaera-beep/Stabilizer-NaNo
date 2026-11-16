@@ -256,6 +256,7 @@ pub struct StateMachine {
     rx_history: [bool; 3],
     rx_history_idx: usize,
     recent_rx_active_this_tick: bool,
+    warmup_just_entered: bool,
     last_rx_bytes_per_sec: u64,
     last_tx_bytes_per_sec: u64,
 
@@ -298,6 +299,7 @@ impl StateMachine {
             rx_history: [false; 3],
             rx_history_idx: 0,
             recent_rx_active_this_tick: false,
+            warmup_just_entered: false,
             last_rx_bytes_per_sec: 0,
             last_tx_bytes_per_sec: 0,
             rng_state: 0x9E37_79B9_7F4A_7C15,
@@ -376,9 +378,12 @@ impl StateMachine {
         &self.config
     }
 
-    pub fn update_config(&mut self, config: StabilizerConfig) {
+    pub fn update_config(&mut self, config: StabilizerConfig) -> Vec<Action> {
         self.config = config;
         self.recompute_next_live_interval();
+        let mut actions = Vec::new();
+        self.reconcile_mode_change(&mut actions);
+        actions
     }
 
     /// Returns `true` when Wi-Fi is default or screen-off/Doze rules force zero-ping `Quiet` standby.
@@ -402,9 +407,6 @@ impl StateMachine {
         if self.context.is_wifi_default && !self.context.has_active_tethering() {
             return false;
         }
-        if self.context.low_battery_or_saver {
-            return false;
-        }
         if (self.context.is_doze || !self.is_screen_on)
             && !self.context.has_active_tethering()
             && !self.context.in_call
@@ -413,17 +415,62 @@ impl StateMachine {
             return false;
         }
 
+        // Explicit user overrides (Boost 30m, in-call, active tethering, or Live profile)
+        // honor keepalive intent even when Android Battery Saver is active.
+        if self.context.boost_active || self.context.in_call || self.context.has_active_tethering()
+        {
+            return true;
+        }
+
         match self.config.profile {
             StabilizerProfile::Eco => false,
             StabilizerProfile::Live => true,
             StabilizerProfile::Auto => {
-                self.context.in_call
-                    || self.context.boost_active
-                    || self.context.has_active_tethering()
-                    || self.context.live_app_active
-                    || (self.config.live_on_charging
-                        && self.context.is_charging
-                        && self.is_screen_on)
+                !self.context.low_battery_or_saver
+                    && (self.context.live_app_active
+                        || (self.config.live_on_charging
+                            && self.context.is_charging
+                            && self.is_screen_on))
+            }
+        }
+    }
+
+    fn reconcile_mode_change(&mut self, actions: &mut Vec<Action>) {
+        if !self.is_running || !self.has_internet || !self.is_validated {
+            return;
+        }
+        if self.context.is_wifi_default && !self.context.has_active_tethering() {
+            return;
+        }
+
+        if self.is_live_eligible() {
+            if matches!(
+                self.state,
+                StabilizerState::Quiet | StabilizerState::EcoTailCheck | StabilizerState::Warmup
+            ) {
+                self.secs_since_last_probe = 0;
+                self.recompute_next_live_interval();
+                let label = self.live_reason_label();
+                self.transition_to(StabilizerState::LiveKeepalive, &label, actions);
+                actions.push(Action::SendProbe {
+                    tier: ProbeTier::L1Dns,
+                    reason: PingReason::LiveKeepalive,
+                });
+            } else if self.state == StabilizerState::LiveKeepalive {
+                self.state_reason = self.live_reason_label();
+            }
+        } else if self.state == StabilizerState::LiveKeepalive {
+            if self.is_quiet_forced() || self.context.low_battery_or_saver {
+                let label = self.quiet_reason_label();
+                self.transition_to(StabilizerState::Quiet, &label, actions);
+            } else {
+                self.eco_checks_sent = 0;
+                self.secs_since_last_probe = 0;
+                self.transition_to(
+                    StabilizerState::EcoTailCheck,
+                    "Switched to Eco mode",
+                    actions,
+                );
             }
         }
     }
@@ -617,14 +664,9 @@ impl StateMachine {
                         &self.quiet_reason_label(),
                         &mut actions,
                     );
-                } else if !prev_live
-                    && self.is_live_eligible()
-                    && self.state == StabilizerState::Quiet
-                {
-                    self.secs_since_last_probe = 0;
-                    self.recompute_next_live_interval();
-                    let label = self.live_reason_label();
-                    self.transition_to(StabilizerState::LiveKeepalive, &label, &mut actions);
+                } else {
+                    let _ = prev_live;
+                    self.reconcile_mode_change(&mut actions);
                 }
             }
             Event::NetworkCapabilitiesChanged {
@@ -632,6 +674,7 @@ impl StateMachine {
                 is_validated,
             } => {
                 let had_internet = self.has_internet;
+                let had_validated = self.is_validated;
                 self.has_internet = has_internet;
                 self.is_validated = is_validated;
 
@@ -656,10 +699,12 @@ impl StateMachine {
                     self.consecutive_failed_ladders = 0;
                     self.outage_backoff_step = 0;
                     self.outage_wait_secs = 0;
-                    if matches!(
-                        self.state,
-                        StabilizerState::Recovering | StabilizerState::Outage
-                    ) {
+                    if !had_validated
+                        && matches!(
+                            self.state,
+                            StabilizerState::Recovering | StabilizerState::Outage
+                        )
+                    {
                         self.reset_recovery_episode();
                         let next_state = if self.is_quiet_forced() {
                             StabilizerState::Quiet
@@ -928,7 +973,13 @@ impl StateMachine {
                     return actions;
                 }
 
-                self.idle_secs = self.idle_secs.saturating_add(dt);
+                let idle_dt = if self.warmup_just_entered {
+                    self.warmup_just_entered = false;
+                    dt.min(1)
+                } else {
+                    dt
+                };
+                self.idle_secs = self.idle_secs.saturating_add(idle_dt);
 
                 // Screen-off heavy download grace period before entering Quiet.
                 if self.state == StabilizerState::Active
@@ -1226,6 +1277,7 @@ impl StateMachine {
         self.state_reason = reason.to_owned();
         if self.state != next {
             self.state = next;
+            self.warmup_just_entered = next == StabilizerState::Warmup;
             if matches!(next, StabilizerState::Quiet | StabilizerState::Stopped) {
                 self.rx_history = [false; 3];
                 self.rx_history_idx = 0;
@@ -1625,5 +1677,62 @@ mod tests {
         });
         sm.handle_event(Event::TickElapsed { secs: 10 });
         assert_eq!(sm.state(), StabilizerState::Quiet);
+    }
+
+    #[test]
+    fn live_and_boost_override_battery_saver_and_warmup_survives_wake_tick() {
+        let mut sm = started_machine(StabilizerProfile::Auto);
+        sm.handle_event(Event::ContextChanged(RuntimeContext {
+            low_battery_or_saver: true,
+            ..RuntimeContext::default()
+        }));
+
+        // Screen off -> Screen wake -> immediate 7s tick leftover from Quiet must NOT kill Warmup.
+        sm.handle_event(Event::ScreenChanged {
+            is_screen_on: false,
+            is_unlocked: false,
+        });
+        sm.handle_event(Event::ScreenChanged {
+            is_screen_on: true,
+            is_unlocked: true,
+        });
+        assert_eq!(sm.state(), StabilizerState::Warmup);
+        sm.handle_event(Event::TickElapsed { secs: 7 });
+        assert_eq!(
+            sm.state(),
+            StabilizerState::Warmup,
+            "first post-wake tick must preserve Warmup window"
+        );
+
+        // Settle to Quiet · battery saver, then turn on Boost 30m -> immediately enters LiveKeepalive + probes!
+        for _ in 0..4 {
+            sm.handle_event(Event::TickElapsed { secs: 1 });
+        }
+        assert_eq!(sm.state(), StabilizerState::Quiet);
+
+        let boost_actions = sm.handle_event(Event::ContextChanged(RuntimeContext {
+            low_battery_or_saver: true,
+            boost_active: true,
+            ..RuntimeContext::default()
+        }));
+        assert_eq!(sm.state(), StabilizerState::LiveKeepalive);
+        assert_eq!(count_probes(&boost_actions), 1);
+
+        // Cancel Boost back to Auto -> returns cleanly to Quiet · battery saver.
+        sm.handle_event(Event::ContextChanged(RuntimeContext {
+            low_battery_or_saver: true,
+            boost_active: false,
+            ..RuntimeContext::default()
+        }));
+        assert_eq!(sm.state(), StabilizerState::Quiet);
+
+        // Explicitly switch profile to Live while Battery Saver is ON -> immediately enters LiveKeepalive!
+        let live_cfg = StabilizerConfig {
+            profile: StabilizerProfile::Live,
+            ..StabilizerConfig::default()
+        };
+        let cfg_actions = sm.update_config(live_cfg);
+        assert_eq!(sm.state(), StabilizerState::LiveKeepalive);
+        assert_eq!(count_probes(&cfg_actions), 1);
     }
 }

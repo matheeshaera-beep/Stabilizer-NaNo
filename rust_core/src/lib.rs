@@ -270,19 +270,39 @@ impl StabilizerEngine {
             .validate()
             .map_err(|reason| StabilizerError::InvalidConfig { reason })?;
 
-        let snapshot = {
+        let (actions, ping_url, snapshot) = {
             let mut guard = self
                 .inner
                 .lock()
                 .map_err(|_| StabilizerError::RuntimeInit {
                     reason: "engine lock poisoned".to_owned(),
                 })?;
-            guard.sm.update_config(config);
+            let actions = guard.sm.update_config(config);
             guard.push_log(LogLevel::Info, "Updated V2 configuration");
-            guard.snapshot()
+            for action in &actions {
+                if let Action::Log(level, msg) = action {
+                    guard.push_log(*level, msg.clone());
+                }
+            }
+            let url = guard.sm.config().ping_url.clone();
+            (actions, url, guard.snapshot())
         };
 
         self.observer.on_telemetry_updated(snapshot);
+        for action in actions {
+            match action {
+                Action::SendProbe { tier, reason } => {
+                    self.spawn_probe(tier, reason, ping_url.clone());
+                }
+                Action::RequestAndroidRevalidation => {
+                    self.observer.on_request_android_revalidation();
+                }
+                Action::TriggerRootRecovery => {
+                    self.observer.on_request_root_recovery();
+                }
+                Action::Log(_, _) => {}
+            }
+        }
         Ok(())
     }
 
@@ -442,7 +462,7 @@ impl StabilizerEngine {
                 guard.is_calibrating = false;
                 let mut updated = guard.sm.config().clone();
                 updated.radio_tail_secs = recommended;
-                guard.sm.update_config(updated);
+                let _ = guard.sm.update_config(updated);
                 guard.push_log(LogLevel::Info, summary.clone());
                 guard.snapshot()
             };
