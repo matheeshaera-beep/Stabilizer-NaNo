@@ -233,12 +233,16 @@ impl CellularPinger {
         // and our own DNS traffic stays inside our app UID for TrafficStats subtraction.
         let dns_idx = self.pick_target_index();
         let dns_server = DEFAULT_DNS_TARGETS[dns_idx];
-        if let Ok(ip) = self.udp_dns_resolve_a(dns_server, host).await {
-            return Ok(SocketAddr::new(IpAddr::V4(ip), port));
+        match self.udp_dns_resolve_a(dns_server, host).await {
+            Ok(ip) => return Ok(SocketAddr::new(IpAddr::V4(ip), port)),
+            Err(err) if err.contains("cellular network unavailable") => return Err(err),
+            Err(_) => {}
         }
         let alt_server = DEFAULT_DNS_TARGETS[(dns_idx + 1) % DEFAULT_DNS_TARGETS.len()];
-        if let Ok(ip) = self.udp_dns_resolve_a(alt_server, host).await {
-            return Ok(SocketAddr::new(IpAddr::V4(ip), port));
+        match self.udp_dns_resolve_a(alt_server, host).await {
+            Ok(ip) => return Ok(SocketAddr::new(IpAddr::V4(ip), port)),
+            Err(err) if err.contains("cellular network unavailable") => return Err(err),
+            Err(_) => {}
         }
 
         // Fallback to OS resolver (for localhost / IPv6-only / local test hosts).
@@ -259,7 +263,9 @@ impl CellularPinger {
 
         #[cfg(unix)]
         {
-            let _ = self.binder.bind_cellular_fd(socket.as_raw_fd());
+            if !self.binder.bind_cellular_fd(socket.as_raw_fd()) {
+                return Err("cellular network unavailable for socket bind".to_owned());
+            }
         }
 
         socket
@@ -281,7 +287,9 @@ impl CellularPinger {
 
         #[cfg(unix)]
         {
-            let _ = self.binder.bind_cellular_fd(std_sock.as_raw_fd());
+            if !self.binder.bind_cellular_fd(std_sock.as_raw_fd()) {
+                return Err("cellular network unavailable for socket bind".to_owned());
+            }
         }
 
         UdpSocket::from_std(std_sock).map_err(|err| format!("failed to wrap UDP socket: {err}"))

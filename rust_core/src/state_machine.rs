@@ -381,13 +381,9 @@ impl StateMachine {
         self.recompute_next_live_interval();
     }
 
-    /// Returns `true` when Wi-Fi is default or power/Doze rules force zero-ping `Quiet` standby.
+    /// Returns `true` when Wi-Fi is default or screen-off/Doze rules force zero-ping `Quiet` standby.
     pub fn is_quiet_forced(&self) -> bool {
         if self.context.is_wifi_default && !self.context.has_active_tethering() {
-            return true;
-        }
-        if self.context.low_battery_or_saver && !self.context.in_call && !self.context.boost_active
-        {
             return true;
         }
         if (self.context.is_doze || !self.is_screen_on)
@@ -734,7 +730,10 @@ impl StateMachine {
                 self.rx_history_idx = (self.rx_history_idx + 1) % 3;
                 let rx_hits = self.rx_history.iter().filter(|&&hit| hit).count();
 
-                let enters_active = rx_bytes_delta >= HEAVY_DOWNLOAD_BYTES_PER_SEC || rx_hits >= 2;
+                let enters_active = rx_bytes_delta >= HEAVY_DOWNLOAD_BYTES_PER_SEC
+                    || (self.state == StabilizerState::Quiet
+                        && rx_bytes_delta >= ACTIVE_RX_THRESHOLD_BYTES_PER_SEC * 2)
+                    || rx_hits >= 2;
 
                 if enters_active || (self.state == StabilizerState::Active && rx_is_strong) {
                     self.idle_secs = 0;
@@ -749,8 +748,13 @@ impl StateMachine {
                     {
                         self.consecutive_failed_ladders = 0;
                         self.outage_backoff_step = 0;
-                        let kbps = rx_bytes_delta as f64 / 1024.0;
-                        let msg = format!("RX active ({kbps:.1} KB/s) -> 0 pings");
+                        let rx_kbps = rx_bytes_delta as f64 / 1024.0;
+                        let tx_kbps = tx_bytes_delta as f64 / 1024.0;
+                        let msg = if rx_bytes_delta >= ACTIVE_RX_THRESHOLD_BYTES_PER_SEC {
+                            format!("RX active ({rx_kbps:.1} KB/s) -> 0 pings")
+                        } else {
+                            format!("Traffic active (RX {rx_kbps:.1} / TX {tx_kbps:.1} KB/s) -> 0 pings")
+                        };
                         self.transition_to(StabilizerState::Active, &msg, &mut actions);
                     }
                     return actions;
@@ -995,8 +999,15 @@ impl StateMachine {
                 }
 
                 // Eco mode: send at most MAX_ECO_TAIL_CHECKS inside radio_tail_secs, then Quiet (0 pings).
+                // Under low battery / Battery Saver, skip tail checks and enter Quiet immediately once idle.
                 if self.state == StabilizerState::Quiet {
                     self.state_reason = self.quiet_reason_label();
+                    return actions;
+                }
+
+                if self.context.low_battery_or_saver {
+                    let label = self.quiet_reason_label();
+                    self.transition_to(StabilizerState::Quiet, &label, &mut actions);
                     return actions;
                 }
 
@@ -1215,6 +1226,10 @@ impl StateMachine {
         self.state_reason = reason.to_owned();
         if self.state != next {
             self.state = next;
+            if matches!(next, StabilizerState::Quiet | StabilizerState::Stopped) {
+                self.rx_history = [false; 3];
+                self.rx_history_idx = 0;
+            }
             actions.push(Action::Log(LogLevel::Info, reason.to_owned()));
         }
     }
@@ -1545,5 +1560,70 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn battery_saver_preserves_active_hysteresis_and_avoids_flapping() {
+        let mut sm = started_machine(StabilizerProfile::Auto);
+        sm.handle_event(Event::ContextChanged(RuntimeContext {
+            low_battery_or_saver: true,
+            ..RuntimeContext::default()
+        }));
+
+        // Screen wake while in Battery Saver must keep Warmup probe intact (not snap to Quiet on 1s pause).
+        sm.handle_event(Event::ScreenChanged {
+            is_screen_on: false,
+            is_unlocked: false,
+        });
+        let wake_actions = sm.handle_event(Event::ScreenChanged {
+            is_screen_on: true,
+            is_unlocked: true,
+        });
+        assert_eq!(sm.state(), StabilizerState::Warmup);
+        assert_eq!(count_probes(&wake_actions), 1);
+
+        // Active download burst + 2-second micro-pauses must stay Active (0 flapping, 0 pings).
+        sm.handle_event(Event::TrafficObserved {
+            rx_bytes_delta: 69_000,
+            tx_bytes_delta: 1_200,
+        });
+        sm.handle_event(Event::TickElapsed { secs: 1 });
+        assert_eq!(sm.state(), StabilizerState::Active);
+
+        for _ in 0..2 {
+            sm.handle_event(Event::TrafficObserved {
+                rx_bytes_delta: 100,
+                tx_bytes_delta: 20,
+            });
+            let pause_actions = sm.handle_event(Event::TickElapsed { secs: 1 });
+            assert_eq!(
+                sm.state(),
+                StabilizerState::Active,
+                "micro-pause < idle_threshold_secs must stay Active"
+            );
+            assert_eq!(count_probes(&pause_actions), 0);
+        }
+
+        // After full idle_threshold_secs (4s), settles ONCE into Quiet with 0 EcoTailCheck pings.
+        let mut extra_tail_probes = 0;
+        for _ in 0..4 {
+            sm.handle_event(Event::TrafficObserved {
+                rx_bytes_delta: 40,
+                tx_bytes_delta: 0,
+            });
+            let idle_actions = sm.handle_event(Event::TickElapsed { secs: 1 });
+            extra_tail_probes += count_probes(&idle_actions);
+        }
+        assert_eq!(sm.state(), StabilizerState::Quiet);
+        assert!(sm.state_reason().contains("battery saver"));
+        assert_eq!(extra_tail_probes, 0);
+
+        // A single tiny upload/ACK residue after Quiet must NOT ghost-wake Active.
+        sm.handle_event(Event::TrafficObserved {
+            rx_bytes_delta: 500,
+            tx_bytes_delta: 1_200,
+        });
+        sm.handle_event(Event::TickElapsed { secs: 10 });
+        assert_eq!(sm.state(), StabilizerState::Quiet);
     }
 }

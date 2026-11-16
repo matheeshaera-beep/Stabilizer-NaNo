@@ -26,6 +26,7 @@ import android.os.IBinder
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
 import android.os.Process
+import android.os.SystemClock
 import android.telephony.SubscriptionManager
 import android.telephony.TelephonyCallback
 import android.telephony.TelephonyDisplayInfo
@@ -46,11 +47,13 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChangedBy
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -67,6 +70,7 @@ class StabilizerForegroundService : Service(), CellularNetworkDelegate {
     private val preferredCellularNetwork = AtomicReference<Network?>(null)
     private val isWifiDefaultRoute = AtomicBoolean(false)
     private val boostActiveFlag = AtomicBoolean(false)
+    private val samplerWakeSignal = Channel<Unit>(Channel.CONFLATED)
 
     private var listenersRegistered = false
     private var trafficJob: Job? = null
@@ -86,9 +90,11 @@ class StabilizerForegroundService : Service(), CellularNetworkDelegate {
                 Intent.ACTION_SCREEN_ON -> {
                     val unlocked = !isKeyguardLocked()
                     engine.onScreenStateChanged(isScreenOn = true, isUnlocked = unlocked)
+                    samplerWakeSignal.trySend(Unit)
                 }
                 Intent.ACTION_USER_PRESENT -> {
                     engine.onScreenStateChanged(isScreenOn = true, isUnlocked = true)
+                    samplerWakeSignal.trySend(Unit)
                 }
                 PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED,
                 PowerManager.ACTION_POWER_SAVE_MODE_CHANGED,
@@ -198,6 +204,9 @@ class StabilizerForegroundService : Service(), CellularNetworkDelegate {
         boostActiveFlag.set(active)
         if (::tetheringDetector.isInitialized) {
             pushContextIfChanged(tetheringDetector.inspect())
+        }
+        if (active) {
+            samplerWakeSignal.trySend(Unit)
         }
     }
 
@@ -450,13 +459,27 @@ class StabilizerForegroundService : Service(), CellularNetworkDelegate {
                 null
             }
 
+            // Drain any stale wake signal queued before sampler start.
+            samplerWakeSignal.tryReceive()
+            var lastSampleAtMs = SystemClock.elapsedRealtime()
+
             while (isActive) {
                 val sampleMs = StabilizerRepository.telemetry.value.recommendedSampleMs
                     .toLong()
                     .coerceIn(1_000L, 10_000L)
-                delay(sampleMs)
+                withTimeoutOrNull(sampleMs) {
+                    samplerWakeSignal.receive()
+                }
+                val sinceLastMs = SystemClock.elapsedRealtime() - lastSampleAtMs
+                if (sinceLastMs < 1_000L) {
+                    delay(1_000L - sinceLastMs)
+                }
 
-                val elapsedSecs = (sampleMs / 1_000L).coerceAtLeast(1L).toULong()
+                val nowMs = SystemClock.elapsedRealtime()
+                val elapsedSecs = ((nowMs - lastSampleAtMs + 500L) / 1_000L)
+                    .coerceAtLeast(1L)
+                    .toULong()
+                lastSampleAtMs = nowMs
                 val currMobileRx = readMobileRxBytes()
                 val currMobileTx = readMobileTxBytes()
                 val currOwnRx = readUidRxBytes(uid)

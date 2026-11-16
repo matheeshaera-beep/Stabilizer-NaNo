@@ -2,7 +2,7 @@ pub mod pinger;
 pub mod state_machine;
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -12,7 +12,7 @@ pub use state_machine::{
     LogLevel, RuntimeContext, StabilizerConfig, StabilizerProfile, StabilizerState,
 };
 use thiserror::Error;
-use tokio::runtime::Runtime;
+use tokio::runtime::Handle;
 use tokio::sync::watch;
 
 uniffi::setup_scaffolding!();
@@ -188,9 +188,9 @@ pub struct StabilizerEngine {
     inner: Arc<Mutex<EngineInner>>,
     observer: Arc<dyn StabilizerObserver>,
     pinger: CellularPinger,
-    runtime: Runtime,
+    runtime_handle: Handle,
     shutdown_tx: watch::Sender<bool>,
-    probe_in_flight: Arc<AtomicBool>,
+    in_flight_probes: Arc<AtomicUsize>,
     calibrating_flag: Arc<AtomicBool>,
 }
 
@@ -213,8 +213,9 @@ impl StabilizerEngine {
         let pinger = CellularPinger::new(binder)
             .map_err(|reason| StabilizerError::RuntimeInit { reason })?;
 
-        // Single-threaded Tokio runtime (current_thread) run on one dedicated background thread
-        // to eliminate multi-worker scheduler wakeups and minimize battery overhead.
+        // Single-threaded Tokio runtime (`current_thread`) owned directly by one dedicated thread
+        // calling `runtime.block_on(...)` so the reactor and spawned tasks actually run while
+        // keeping zero worker-pool overhead.
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .thread_name("stabilizer-nano-rt")
@@ -223,23 +224,22 @@ impl StabilizerEngine {
             .map_err(|err| StabilizerError::RuntimeInit {
                 reason: format!("failed to create Tokio runtime: {err}"),
             })?;
+        let runtime_handle = runtime.handle().clone();
 
         let engine = Arc::new(Self {
             inner: Arc::new(Mutex::new(EngineInner::new(config))),
             observer,
             pinger,
-            runtime,
+            runtime_handle,
             shutdown_tx,
-            probe_in_flight: Arc::new(AtomicBool::new(false)),
+            in_flight_probes: Arc::new(AtomicUsize::new(0)),
             calibrating_flag: Arc::new(AtomicBool::new(false)),
         });
 
-        // Drive the `current_thread` Tokio reactor on a background thread until shutdown.
-        let rt_handle = engine.runtime.handle().clone();
         std::thread::Builder::new()
             .name("stabilizer-nano-tokio".to_owned())
             .spawn(move || {
-                rt_handle.block_on(async move {
+                runtime.block_on(async move {
                     while shutdown_rx.changed().await.is_ok() {
                         if *shutdown_rx.borrow() {
                             break;
@@ -364,7 +364,7 @@ impl StabilizerEngine {
         let calibrating_flag = Arc::clone(&self.calibrating_flag);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
-        self.runtime.spawn(async move {
+        self.runtime_handle.spawn(async move {
             let gaps: [u64; 6] = [3, 6, 10, 15, 30, 60];
             let mut results: Vec<(u64, Option<u64>)> = Vec::with_capacity(gaps.len());
 
@@ -561,134 +561,145 @@ impl StabilizerEngine {
     }
 
     fn spawn_probe(&self, tier: ProbeTier, reason: PingReason, url: String) {
-        let is_background = matches!(
+        spawn_probe_shared(
+            self.runtime_handle.clone(),
+            self.pinger.clone(),
+            Arc::clone(&self.inner),
+            Arc::clone(&self.observer),
+            Arc::clone(&self.in_flight_probes),
+            tier,
             reason,
-            PingReason::LiveKeepalive | PingReason::EcoTail | PingReason::OutageCheck
+            url,
         );
-        if is_background
-            && self
-                .probe_in_flight
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
+    }
+}
+
+struct ProbeFlightGuard(Arc<AtomicUsize>);
+
+impl Drop for ProbeFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_probe_shared(
+    runtime_handle: Handle,
+    pinger: CellularPinger,
+    inner: Arc<Mutex<EngineInner>>,
+    observer: Arc<dyn StabilizerObserver>,
+    in_flight_probes: Arc<AtomicUsize>,
+    tier: ProbeTier,
+    reason: PingReason,
+    url: String,
+) {
+    let is_background = matches!(
+        reason,
+        PingReason::LiveKeepalive | PingReason::EcoTail | PingReason::OutageCheck
+    );
+    if is_background {
+        if in_flight_probes
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
         {
             return;
         }
-        if !is_background {
-            self.probe_in_flight.store(true, Ordering::Release);
-        }
+    } else {
+        in_flight_probes.fetch_add(1, Ordering::AcqRel);
+    }
 
-        let pinger = self.pinger.clone();
-        let inner = Arc::clone(&self.inner);
-        let observer = Arc::clone(&self.observer);
-        let probe_in_flight = Arc::clone(&self.probe_in_flight);
+    let spawn_handle = runtime_handle.clone();
+    runtime_handle.spawn(async move {
+        let _flight_guard = ProbeFlightGuard(Arc::clone(&in_flight_probes));
+        let result = pinger.probe(tier, &url).await;
 
-        self.runtime.spawn(async move {
-            let result = pinger.probe(tier, &url).await;
-            probe_in_flight.store(false, Ordering::Release);
-
-            let (succeeded, follow_actions, ping_url, snapshot) = {
-                let mut guard = match inner.lock() {
-                    Ok(g) => g,
-                    Err(p) => p.into_inner(),
-                };
-                if guard.shut_down {
-                    return;
+        let (follow_actions, ping_url, snapshot) = {
+            let mut guard = match inner.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            if guard.shut_down {
+                return;
+            }
+            guard.total_pings = guard.total_pings.saturating_add(1);
+            let label = match reason {
+                PingReason::Warmup => "Warmup",
+                PingReason::EcoTail => "EcoTail",
+                PingReason::LiveKeepalive => "Live",
+                PingReason::LiveReverify => "LiveVerify",
+                PingReason::StallCheck => "StallCheck",
+                PingReason::RadioEvent => "RadioEvent",
+                PingReason::Recovery => "Recovery",
+                PingReason::OutageCheck => "OutageCheck",
+            };
+            let ok = match &result {
+                Ok(outcome) => {
+                    guard.successful_pings = guard.successful_pings.saturating_add(1);
+                    guard.last_ping_latency_ms = Some(outcome.latency_ms);
+                    guard.total_probe_bytes = guard
+                        .total_probe_bytes
+                        .saturating_add(outcome.bytes_estimated);
+                    let status_desc = if outcome.status_code > 0 {
+                        format!("HTTP {}", outcome.status_code)
+                    } else {
+                        outcome.target.clone()
+                    };
+                    guard.push_log(
+                        LogLevel::Info,
+                        format!(
+                            "{label} [{:?}] {status_desc} -> {}ms (~{}B)",
+                            outcome.tier, outcome.latency_ms, outcome.bytes_estimated
+                        ),
+                    );
+                    true
                 }
-                guard.total_pings = guard.total_pings.saturating_add(1);
-                let label = match reason {
-                    PingReason::Warmup => "Warmup",
-                    PingReason::EcoTail => "EcoTail",
-                    PingReason::LiveKeepalive => "Live",
-                    PingReason::LiveReverify => "LiveVerify",
-                    PingReason::StallCheck => "StallCheck",
-                    PingReason::RadioEvent => "RadioEvent",
-                    PingReason::Recovery => "Recovery",
-                    PingReason::OutageCheck => "OutageCheck",
-                };
-                let ok = match &result {
-                    Ok(outcome) => {
-                        guard.successful_pings = guard.successful_pings.saturating_add(1);
-                        guard.last_ping_latency_ms = Some(outcome.latency_ms);
-                        guard.total_probe_bytes = guard
-                            .total_probe_bytes
-                            .saturating_add(outcome.bytes_estimated);
-                        let status_desc = if outcome.status_code > 0 {
-                            format!("HTTP {}", outcome.status_code)
-                        } else {
-                            outcome.target.clone()
-                        };
-                        guard.push_log(
-                            LogLevel::Info,
-                            format!(
-                                "{label} [{:?}] {status_desc} -> {}ms (~{}B)",
-                                outcome.tier, outcome.latency_ms, outcome.bytes_estimated
-                            ),
-                        );
-                        true
-                    }
-                    Err(err_msg) => {
-                        guard.failed_pings = guard.failed_pings.saturating_add(1);
-                        guard.push_log(LogLevel::Warn, format!("{label} probe error: {err_msg}"));
-                        false
-                    }
-                };
-
-                let follow = guard.sm.handle_event(Event::ProbeCompleted {
-                    tier,
-                    reason,
-                    succeeded: ok,
-                });
-                for action in &follow {
-                    if let Action::Log(lvl, msg) = action {
-                        guard.push_log(*lvl, msg.clone());
-                    }
+                Err(err_msg) => {
+                    guard.failed_pings = guard.failed_pings.saturating_add(1);
+                    guard.push_log(LogLevel::Warn, format!("{label} probe error: {err_msg}"));
+                    false
                 }
-                let url = guard.sm.config().ping_url.clone();
-                (ok, follow, url, guard.snapshot())
             };
 
-            let _ = succeeded;
-            observer.on_telemetry_updated(snapshot);
-
-            for action in follow_actions {
-                match action {
-                    Action::RequestAndroidRevalidation => {
-                        observer.on_request_android_revalidation();
-                    }
-                    Action::TriggerRootRecovery => {
-                        observer.on_request_root_recovery();
-                    }
-                    Action::SendProbe { tier, reason } => {
-                        if let Ok(outcome) = pinger.probe(tier, &ping_url).await {
-                            let mut guard = match inner.lock() {
-                                Ok(g) => g,
-                                Err(p) => p.into_inner(),
-                            };
-                            if !guard.shut_down {
-                                guard.total_pings = guard.total_pings.saturating_add(1);
-                                guard.successful_pings = guard.successful_pings.saturating_add(1);
-                                guard.last_ping_latency_ms = Some(outcome.latency_ms);
-                                guard.total_probe_bytes = guard
-                                    .total_probe_bytes
-                                    .saturating_add(outcome.bytes_estimated);
-                                guard.push_log(
-                                    LogLevel::Info,
-                                    format!(
-                                        "Follow-up {:?} ({:?}) -> {}ms",
-                                        reason, tier, outcome.latency_ms
-                                    ),
-                                );
-                                let snap = guard.snapshot();
-                                drop(guard);
-                                observer.on_telemetry_updated(snap);
-                            }
-                        }
-                    }
-                    Action::Log(_, _) => {}
+            let follow = guard.sm.handle_event(Event::ProbeCompleted {
+                tier,
+                reason,
+                succeeded: ok,
+            });
+            for action in &follow {
+                if let Action::Log(lvl, msg) = action {
+                    guard.push_log(*lvl, msg.clone());
                 }
             }
-        });
-    }
+            let url = guard.sm.config().ping_url.clone();
+            (follow, url, guard.snapshot())
+        };
+
+        observer.on_telemetry_updated(snapshot);
+
+        for action in follow_actions {
+            match action {
+                Action::RequestAndroidRevalidation => {
+                    observer.on_request_android_revalidation();
+                }
+                Action::TriggerRootRecovery => {
+                    observer.on_request_root_recovery();
+                }
+                Action::SendProbe { tier, reason } => {
+                    spawn_probe_shared(
+                        spawn_handle.clone(),
+                        pinger.clone(),
+                        Arc::clone(&inner),
+                        Arc::clone(&observer),
+                        Arc::clone(&in_flight_probes),
+                        tier,
+                        reason,
+                        ping_url.clone(),
+                    );
+                }
+                Action::Log(_, _) => {}
+            }
+        }
+    });
 }
 
 /// Estimates `radio_tail_secs` from `(gap_secs, Option<rtt_ms>)` calibration samples.
@@ -799,5 +810,57 @@ mod tests {
             (30, Some(260)),
         ];
         assert_eq!(estimate_tail_from_samples(&samples), 10);
+    }
+
+    #[test]
+    fn engine_executes_spawned_probes_on_reactor_thread() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local tcp listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server_thread = std::thread::spawn(move || {
+            for _ in 0..2 {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                }
+            }
+        });
+
+        let observer = Arc::new(TestObserver::new());
+        let cfg = StabilizerConfig {
+            ping_url: format!("http://{addr}/generate_204"),
+            ..StabilizerConfig::default()
+        };
+        let engine = StabilizerEngine::new(cfg, observer).expect("engine init");
+        engine.on_network_capabilities_changed(true, true);
+        engine.on_screen_state_changed(true, true);
+        engine.start();
+        engine.probe_now();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let snap = engine.get_telemetry();
+            if snap.successful_pings >= 2 {
+                assert!(snap.last_ping_latency_ms.is_some());
+                assert!(snap
+                    .logs
+                    .iter()
+                    .any(|entry| entry.message.contains("Warmup [L2HttpHead] HTTP 204")));
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "spawned probes did not complete in time: pings={}, logs={:?}",
+                snap.total_pings,
+                snap.logs
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        engine.shutdown();
+        let _ = server_thread.join();
     }
 }

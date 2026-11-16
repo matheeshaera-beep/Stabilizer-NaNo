@@ -3,6 +3,7 @@ package com.stabilizernano.app.service
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.wifi.WifiManager
+import android.os.SystemClock
 import java.io.File
 import java.lang.reflect.Proxy
 import java.net.NetworkInterface
@@ -32,6 +33,12 @@ class TetheringDetector(context: Context) {
     private val softApClientCount = AtomicInteger(-1)
     private var softApCallbackProxy: Any? = null
     private val callbackExecutor = Executors.newSingleThreadExecutor()
+
+    @Volatile
+    private var cachedNeighCount: Int = 0
+
+    @Volatile
+    private var lastNeighScanMs: Long = 0L
 
     fun registerCallbacks() {
         if (softApCallbackProxy != null) return
@@ -159,7 +166,11 @@ class TetheringDetector(context: Context) {
         if (arpCount >= 0) return arpCount
 
         // Strategy 2: `ip -4 neigh show` fallback on Android 10+ where /proc/net/arp is restricted.
-        return runCatching {
+        val nowMs = SystemClock.elapsedRealtime()
+        if (lastNeighScanMs > 0L && nowMs - lastNeighScanMs < 5_000L) {
+            return cachedNeighCount
+        }
+        val scanned = runCatching {
             val process = ProcessBuilder("ip", "-4", "neigh", "show")
                 .redirectErrorStream(true)
                 .start()
@@ -173,6 +184,9 @@ class TetheringDetector(context: Context) {
                 activeState && matchesHotspot
             }
         }.getOrDefault(0)
+        cachedNeighCount = scanned
+        lastNeighScanMs = nowMs
+        return scanned
     }
 
     private fun readSysCounter(iface: String, counter: String): Long? {
