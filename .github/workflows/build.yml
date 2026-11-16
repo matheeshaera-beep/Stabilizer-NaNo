@@ -95,6 +95,8 @@ jobs:
           gradle-version: 8.10.2
 
       - name: Bootstrap Gradle wrapper if needed and build debug APK
+        env:
+          CI_VERSION_CODE: ${{ github.run_number }}
         run: |
           if [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
             gradle wrapper --gradle-version 8.10.2

@@ -8,15 +8,26 @@ android {
     namespace = "com.stabilizernano.app"
     compileSdk = 35
 
+    val ciVersionCode = System.getenv("CI_VERSION_CODE")?.toIntOrNull()
+
     defaultConfig {
         applicationId = "com.stabilizernano.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = ciVersionCode ?: 1
+        versionName = if (ciVersionCode != null) "0.1.$ciVersionCode" else "0.1.0"
 
         ndk {
             abiFilters += listOf("arm64-v8a")
+        }
+    }
+
+    signingConfigs {
+        getByName("debug") {
+            storeFile = file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
         }
     }
 
@@ -31,6 +42,7 @@ android {
         }
         debug {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
 
