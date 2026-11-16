@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicU16, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -44,6 +45,23 @@ pub struct ProbeOutcome {
     pub target: String,
 }
 
+/// Typed probe failure separating local socket-bind unavailability from carrier network failures.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProbeFailure {
+    /// Cellular `Network` handle could not be bound while a non-cellular network (Wi-Fi) is default.
+    BindUnavailable(String),
+    /// Network/DNS/TCP/TLS/HTTP timeout or I/O error over the cellular path.
+    Network(String),
+}
+
+impl fmt::Display for ProbeFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BindUnavailable(msg) | Self::Network(msg) => f.write_str(msg),
+        }
+    }
+}
+
 /// Hook allowing Android to bind raw sockets onto the cellular `Network` (`Network.bindSocket`).
 pub trait SocketBinder: Send + Sync {
     fn bind_cellular_fd(&self, fd: i32) -> bool;
@@ -54,6 +72,7 @@ pub trait SocketBinder: Send + Sync {
 pub struct CellularPinger {
     tls_connector: TlsConnector,
     binder: Arc<dyn SocketBinder>,
+    require_cellular_bind: Arc<AtomicBool>,
     next_tx_id: Arc<AtomicU16>,
     rr_counter: Arc<AtomicUsize>,
     rtt_ewma_ms: Arc<Mutex<[Option<u64>; 2]>>,
@@ -83,6 +102,7 @@ impl CellularPinger {
         Ok(Self {
             tls_connector: TlsConnector::from(Arc::new(tls_config)),
             binder,
+            require_cellular_bind: Arc::new(AtomicBool::new(false)),
             next_tx_id: Arc::new(AtomicU16::new(0x1337)),
             rr_counter: Arc::new(AtomicUsize::new(0)),
             rtt_ewma_ms: Arc::new(Mutex::new([None, None])),
@@ -91,8 +111,14 @@ impl CellularPinger {
         })
     }
 
+    /// Configures whether explicit cellular socket binding is mandatory (`true` when Wi-Fi is default)
+    /// or best-effort (`false` when cellular is already the OS default route).
+    pub fn set_require_cellular_bind(&self, require: bool) {
+        self.require_cellular_bind.store(require, Ordering::Release);
+    }
+
     /// Executes an L1 fast probe (`L1Dns` with cellular TCP:443 fallback) or an L2 `HEAD` probe.
-    pub async fn probe(&self, tier: ProbeTier, url: &str) -> Result<ProbeOutcome, String> {
+    pub async fn probe(&self, tier: ProbeTier, url: &str) -> Result<ProbeOutcome, ProbeFailure> {
         match tier {
             ProbeTier::L1Dns => self.probe_l1().await,
             ProbeTier::L2HttpHead => self.probe_l2_head(url).await,
@@ -101,7 +127,7 @@ impl CellularPinger {
 
     /// Sends an ultra-cheap L1 UDP DNS query to the fastest healthy target (`1.1.1.1` / `8.8.8.8`),
     /// falling back immediately to cellular-bound TCP:443 if UDP/53 is filtered by the carrier.
-    pub async fn probe_l1(&self) -> Result<ProbeOutcome, String> {
+    pub async fn probe_l1(&self) -> Result<ProbeOutcome, ProbeFailure> {
         let idx = self.pick_target_index();
         let target = DEFAULT_DNS_TARGETS[idx];
 
@@ -123,13 +149,22 @@ impl CellularPinger {
                         target: format!("tcp://{tcp_target}"),
                     });
                 }
-                Ok(Err(tcp_err)) => {
+                Ok(Err(bind_err @ ProbeFailure::BindUnavailable(_))) => {
+                    self.udp_bypass_remaining
+                        .store(bypass_left, Ordering::Relaxed);
+                    return Err(bind_err);
+                }
+                Ok(Err(ProbeFailure::Network(tcp_err))) => {
                     self.udp_bypass_remaining.store(0, Ordering::Relaxed);
-                    return Err(format!("L1 TCP:443 failed ({tcp_target}): {tcp_err}"));
+                    return Err(ProbeFailure::Network(format!(
+                        "L1 TCP:443 failed ({tcp_target}): {tcp_err}"
+                    )));
                 }
                 Err(_) => {
                     self.udp_bypass_remaining.store(0, Ordering::Relaxed);
-                    return Err(format!("L1 TCP:443 timed out after 3s ({tcp_target})"));
+                    return Err(ProbeFailure::Network(format!(
+                        "L1 TCP:443 timed out after 3s ({tcp_target})"
+                    )));
                 }
             }
         }
@@ -148,36 +183,49 @@ impl CellularPinger {
                     target: format!("dns://{target}"),
                 })
             }
-            Err(dns_err) => {
-                if dns_err.contains("cellular network unavailable") {
-                    return Err(dns_err);
-                }
-
+            Err(bind_err @ ProbeFailure::BindUnavailable(_)) => Err(bind_err),
+            Err(ProbeFailure::Network(dns_err)) => {
                 // Rotate to second DNS server before falling back to TCP connect.
                 let alt_idx = (idx + 1) % DEFAULT_DNS_TARGETS.len();
                 let alt_target = DEFAULT_DNS_TARGETS[alt_idx];
-                if let Ok((rtt_ms, bytes)) = self
+                match self
                     .udp_dns_ping(alt_target, "connectivitycheck.gstatic.com")
                     .await
                 {
-                    self.record_target_rtt(alt_idx, rtt_ms);
-                    return Ok(ProbeOutcome {
-                        tier: ProbeTier::L1Dns,
-                        status_code: 0,
-                        latency_ms: rtt_ms,
-                        bytes_estimated: bytes,
-                        target: format!("dns://{alt_target}"),
-                    });
+                    Ok((rtt_ms, bytes)) => {
+                        self.record_target_rtt(alt_idx, rtt_ms);
+                        return Ok(ProbeOutcome {
+                            tier: ProbeTier::L1Dns,
+                            status_code: 0,
+                            latency_ms: rtt_ms,
+                            bytes_estimated: bytes,
+                            target: format!("dns://{alt_target}"),
+                        });
+                    }
+                    Err(bind_err @ ProbeFailure::BindUnavailable(_)) => return Err(bind_err),
+                    Err(_) => {}
                 }
 
                 // Carrier APN likely blocks/drops port 53 UDP: fall back to TCP:443 SYN-ACK
                 // and bypass UDP/53 for the next `UDP_BYPASS_PROBES` checks so L1 finishes in ~15ms.
                 let tcp_target = SocketAddr::new(target.ip(), 443);
                 let started = Instant::now();
-                let _stream = timeout(L1_TCP_TIMEOUT, self.connect_cellular_tcp(tcp_target))
+                let _stream = match timeout(L1_TCP_TIMEOUT, self.connect_cellular_tcp(tcp_target))
                     .await
-                    .map_err(|_| format!("L1 DNS ({dns_err}) and TCP:443 timed out after 3s"))?
-                    .map_err(|tcp_err| format!("L1 failed (DNS: {dns_err}; TCP: {tcp_err})"))?;
+                {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(bind_err @ ProbeFailure::BindUnavailable(_))) => return Err(bind_err),
+                    Ok(Err(ProbeFailure::Network(tcp_err))) => {
+                        return Err(ProbeFailure::Network(format!(
+                            "L1 failed (DNS: {dns_err}; TCP: {tcp_err})"
+                        )));
+                    }
+                    Err(_) => {
+                        return Err(ProbeFailure::Network(format!(
+                            "L1 DNS ({dns_err}) and TCP:443 timed out after 3s"
+                        )));
+                    }
+                };
 
                 let rtt_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                 self.record_target_rtt(idx, rtt_ms);
@@ -195,31 +243,30 @@ impl CellularPinger {
     }
 
     /// Sends one fresh cellular-bound HTTP/HTTPS `HEAD` probe to `url` with a 10s congested timeout.
-    pub async fn probe_l2_head(&self, url: &str) -> Result<ProbeOutcome, String> {
-        let parsed = ParsedHttpUrl::parse(url)?;
+    pub async fn probe_l2_head(&self, url: &str) -> Result<ProbeOutcome, ProbeFailure> {
+        let parsed = ParsedHttpUrl::parse(url).map_err(ProbeFailure::Network)?;
         let started = Instant::now();
 
-        let outcome = timeout(L2_TIMEOUT, self.execute_l2_head(&parsed, started))
+        timeout(L2_TIMEOUT, self.execute_l2_head(&parsed, started))
             .await
             .map_err(|_| {
-                format!(
+                ProbeFailure::Network(format!(
                     "HEAD probe timed out after {}s ({})",
                     L2_TIMEOUT.as_secs(),
                     parsed.host
-                )
-            })??;
-
-        Ok(outcome)
+                ))
+            })?
     }
 
     async fn execute_l2_head(
         &self,
         parsed: &ParsedHttpUrl,
         started: Instant,
-    ) -> Result<ProbeOutcome, String> {
+    ) -> Result<ProbeOutcome, ProbeFailure> {
         let addr = self.resolve_host(&parsed.host, parsed.port).await?;
         let tcp = match self.connect_cellular_tcp(addr).await {
             Ok(s) => s,
+            Err(err @ ProbeFailure::BindUnavailable(_)) => return Err(err),
             Err(err) => {
                 self.invalidate_dns_cache(&parsed.host);
                 return Err(err);
@@ -232,33 +279,38 @@ impl CellularPinger {
         );
 
         let (status_code, resp_bytes) = if parsed.is_tls {
-            let server_name = ServerName::try_from(parsed.host.clone())
-                .map_err(|_| format!("invalid TLS server name: {}", parsed.host))?;
+            let server_name = ServerName::try_from(parsed.host.clone()).map_err(|_| {
+                ProbeFailure::Network(format!("invalid TLS server name: {}", parsed.host))
+            })?;
             let mut tls_stream = self
                 .tls_connector
                 .connect(server_name, tcp)
                 .await
-                .map_err(|err| format!("TLS handshake failed: {err}"))?;
+                .map_err(|err| ProbeFailure::Network(format!("TLS handshake failed: {err}")))?;
             tls_stream
                 .write_all(req.as_bytes())
                 .await
-                .map_err(|err| format!("TLS write failed: {err}"))?;
+                .map_err(|err| ProbeFailure::Network(format!("TLS write failed: {err}")))?;
             tls_stream
                 .flush()
                 .await
-                .map_err(|err| format!("TLS flush failed: {err}"))?;
-            read_http_status_line(tls_stream).await?
+                .map_err(|err| ProbeFailure::Network(format!("TLS flush failed: {err}")))?;
+            read_http_status_line(tls_stream)
+                .await
+                .map_err(ProbeFailure::Network)?
         } else {
             let mut plain = tcp;
             plain
                 .write_all(req.as_bytes())
                 .await
-                .map_err(|err| format!("HTTP write failed: {err}"))?;
+                .map_err(|err| ProbeFailure::Network(format!("HTTP write failed: {err}")))?;
             plain
                 .flush()
                 .await
-                .map_err(|err| format!("HTTP flush failed: {err}"))?;
-            read_http_status_line(plain).await?
+                .map_err(|err| ProbeFailure::Network(format!("HTTP flush failed: {err}")))?;
+            read_http_status_line(plain)
+                .await
+                .map_err(ProbeFailure::Network)?
         };
 
         let latency_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
@@ -274,7 +326,7 @@ impl CellularPinger {
         })
     }
 
-    async fn resolve_host(&self, host: &str, port: u16) -> Result<SocketAddr, String> {
+    async fn resolve_host(&self, host: &str, port: u16) -> Result<SocketAddr, ProbeFailure> {
         if let Ok(ip) = host.parse::<IpAddr>() {
             return Ok(SocketAddr::new(ip, port));
         }
@@ -294,7 +346,7 @@ impl CellularPinger {
                     self.store_dns_cache(host, ip_addr);
                     return Ok(SocketAddr::new(ip_addr, port));
                 }
-                Err(err) if err.contains("cellular network unavailable") => return Err(err),
+                Err(err @ ProbeFailure::BindUnavailable(_)) => return Err(err),
                 Err(_) => {}
             }
             let alt_server = DEFAULT_DNS_TARGETS[(dns_idx + 1) % DEFAULT_DNS_TARGETS.len()];
@@ -304,18 +356,18 @@ impl CellularPinger {
                     self.store_dns_cache(host, ip_addr);
                     return Ok(SocketAddr::new(ip_addr, port));
                 }
-                Err(err) if err.contains("cellular network unavailable") => return Err(err),
+                Err(err @ ProbeFailure::BindUnavailable(_)) => return Err(err),
                 Err(_) => {}
             }
         }
 
         // Fallback to OS resolver (used when UDP/53 is carrier-filtered, IPv6-only, or localhost).
-        let mut addrs = tokio::net::lookup_host((host, port))
-            .await
-            .map_err(|err| format!("DNS resolution failed for {host}: {err}"))?;
-        let addr = addrs
-            .next()
-            .ok_or_else(|| format!("DNS returned no addresses for {host}"))?;
+        let mut addrs = tokio::net::lookup_host((host, port)).await.map_err(|err| {
+            ProbeFailure::Network(format!("DNS resolution failed for {host}: {err}"))
+        })?;
+        let addr = addrs.next().ok_or_else(|| {
+            ProbeFailure::Network(format!("DNS returned no addresses for {host}"))
+        })?;
         self.store_dns_cache(host, addr.ip());
         Ok(addr)
     }
@@ -350,100 +402,123 @@ impl CellularPinger {
         guard.remove(host);
     }
 
-    async fn connect_cellular_tcp(&self, addr: SocketAddr) -> Result<TcpStream, String> {
+    async fn connect_cellular_tcp(&self, addr: SocketAddr) -> Result<TcpStream, ProbeFailure> {
         let socket = match addr {
             SocketAddr::V4(_) => TcpSocket::new_v4(),
             SocketAddr::V6(_) => TcpSocket::new_v6(),
         }
-        .map_err(|err| format!("failed to allocate TCP socket: {err}"))?;
+        .map_err(|err| ProbeFailure::Network(format!("failed to allocate TCP socket: {err}")))?;
 
         #[cfg(unix)]
         {
-            if !self.binder.bind_cellular_fd(socket.as_raw_fd()) {
-                return Err("cellular network unavailable for socket bind".to_owned());
+            let bound = self.binder.bind_cellular_fd(socket.as_raw_fd());
+            if !bound && self.require_cellular_bind.load(Ordering::Acquire) {
+                return Err(ProbeFailure::BindUnavailable(
+                    "cellular network unavailable for socket bind while Wi-Fi is default"
+                        .to_owned(),
+                ));
             }
         }
 
         socket
             .connect(addr)
             .await
-            .map_err(|err| format!("TCP connect to {addr} failed: {err}"))
+            .map_err(|err| ProbeFailure::Network(format!("TCP connect to {addr} failed: {err}")))
     }
 
-    fn bind_cellular_udp(&self, target: SocketAddr) -> Result<UdpSocket, String> {
+    fn bind_cellular_udp(&self, target: SocketAddr) -> Result<UdpSocket, ProbeFailure> {
         let bind_addr: SocketAddr = match target {
             SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-            SocketAddr::V6(_) => "[::]:0".parse().map_err(|e| format!("{e}"))?,
+            SocketAddr::V6(_) => "[::]:0"
+                .parse()
+                .map_err(|e| ProbeFailure::Network(format!("{e}")))?,
         };
         let std_sock = std::net::UdpSocket::bind(bind_addr)
-            .map_err(|err| format!("failed to bind UDP socket: {err}"))?;
-        std_sock
-            .set_nonblocking(true)
-            .map_err(|err| format!("failed to set UDP nonblocking: {err}"))?;
+            .map_err(|err| ProbeFailure::Network(format!("failed to bind UDP socket: {err}")))?;
+        std_sock.set_nonblocking(true).map_err(|err| {
+            ProbeFailure::Network(format!("failed to set UDP nonblocking: {err}"))
+        })?;
 
         #[cfg(unix)]
         {
-            if !self.binder.bind_cellular_fd(std_sock.as_raw_fd()) {
-                return Err("cellular network unavailable for socket bind".to_owned());
+            let bound = self.binder.bind_cellular_fd(std_sock.as_raw_fd());
+            if !bound && self.require_cellular_bind.load(Ordering::Acquire) {
+                return Err(ProbeFailure::BindUnavailable(
+                    "cellular network unavailable for socket bind while Wi-Fi is default"
+                        .to_owned(),
+                ));
             }
         }
 
-        UdpSocket::from_std(std_sock).map_err(|err| format!("failed to wrap UDP socket: {err}"))
+        UdpSocket::from_std(std_sock)
+            .map_err(|err| ProbeFailure::Network(format!("failed to wrap UDP socket: {err}")))
     }
 
-    async fn udp_dns_ping(&self, server: SocketAddr, qname: &str) -> Result<(u64, u64), String> {
+    async fn udp_dns_ping(
+        &self,
+        server: SocketAddr,
+        qname: &str,
+    ) -> Result<(u64, u64), ProbeFailure> {
         let tx_id = self.next_tx_id.fetch_add(1, Ordering::Relaxed);
-        let packet = build_dns_a_query(tx_id, qname)?;
+        let packet = build_dns_a_query(tx_id, qname).map_err(ProbeFailure::Network)?;
         let sock = self.bind_cellular_udp(server)?;
         let started = Instant::now();
 
-        sock.connect(server)
-            .await
-            .map_err(|err| format!("UDP connect to {server} failed: {err}"))?;
+        sock.connect(server).await.map_err(|err| {
+            ProbeFailure::Network(format!("UDP connect to {server} failed: {err}"))
+        })?;
         sock.send(&packet)
             .await
-            .map_err(|err| format!("UDP DNS send failed: {err}"))?;
+            .map_err(|err| ProbeFailure::Network(format!("UDP DNS send failed: {err}")))?;
 
         let mut buf = [0u8; 512];
         let n = timeout(L1_DNS_TIMEOUT, sock.recv(&mut buf))
             .await
-            .map_err(|_| format!("DNS probe timeout ({server})"))?
-            .map_err(|err| format!("UDP DNS recv failed: {err}"))?;
+            .map_err(|_| ProbeFailure::Network(format!("DNS probe timeout ({server})")))?
+            .map_err(|err| ProbeFailure::Network(format!("UDP DNS recv failed: {err}")))?;
 
         if n < 12 {
-            return Err("truncated DNS response".to_owned());
+            return Err(ProbeFailure::Network("truncated DNS response".to_owned()));
         }
         let resp_id = u16::from_be_bytes([buf[0], buf[1]]);
         if resp_id != tx_id {
-            return Err("mismatched DNS transaction ID".to_owned());
+            return Err(ProbeFailure::Network(
+                "mismatched DNS transaction ID".to_owned(),
+            ));
         }
         let is_response = (buf[2] & 0x80) != 0;
         if !is_response {
-            return Err("invalid DNS response flags".to_owned());
+            return Err(ProbeFailure::Network(
+                "invalid DNS response flags".to_owned(),
+            ));
         }
 
         let rtt_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         Ok((rtt_ms, (packet.len() + n) as u64))
     }
 
-    async fn udp_dns_resolve_a(&self, server: SocketAddr, host: &str) -> Result<Ipv4Addr, String> {
+    async fn udp_dns_resolve_a(
+        &self,
+        server: SocketAddr,
+        host: &str,
+    ) -> Result<Ipv4Addr, ProbeFailure> {
         let tx_id = self.next_tx_id.fetch_add(1, Ordering::Relaxed);
-        let packet = build_dns_a_query(tx_id, host)?;
+        let packet = build_dns_a_query(tx_id, host).map_err(ProbeFailure::Network)?;
         let sock = self.bind_cellular_udp(server)?;
         sock.connect(server)
             .await
-            .map_err(|err| format!("UDP connect failed: {err}"))?;
+            .map_err(|err| ProbeFailure::Network(format!("UDP connect failed: {err}")))?;
         sock.send(&packet)
             .await
-            .map_err(|err| format!("UDP send failed: {err}"))?;
+            .map_err(|err| ProbeFailure::Network(format!("UDP send failed: {err}")))?;
 
         let mut buf = [0u8; 512];
         let n = timeout(L1_DNS_TIMEOUT, sock.recv(&mut buf))
             .await
-            .map_err(|_| "DNS resolve timeout".to_owned())?
-            .map_err(|err| format!("UDP recv failed: {err}"))?;
+            .map_err(|_| ProbeFailure::Network("DNS resolve timeout".to_owned()))?
+            .map_err(|err| ProbeFailure::Network(format!("UDP recv failed: {err}")))?;
 
-        parse_dns_first_a_record(&buf[..n], tx_id)
+        parse_dns_first_a_record(&buf[..n], tx_id).map_err(ProbeFailure::Network)
     }
 
     fn pick_target_index(&self) -> usize {
@@ -718,5 +793,35 @@ mod tests {
             .expect("local HEAD succeeds");
         assert_eq!(outcome.tier, ProbeTier::L2HttpHead);
         assert_eq!(outcome.status_code, 204);
+    }
+
+    struct FailingSocketBinder;
+
+    impl SocketBinder for FailingSocketBinder {
+        fn bind_cellular_fd(&self, _fd: i32) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn bind_failure_proceeds_on_cellular_default_and_blocks_on_wifi_default() {
+        let addr = spawn_test_http_server().await;
+        let pinger = CellularPinger::new(Arc::new(FailingSocketBinder)).expect("pinger init");
+
+        // Cellular default route (require_cellular_bind = false): falls back safely and succeeds.
+        pinger.set_require_cellular_bind(false);
+        let outcome = pinger
+            .probe_l2_head(&format!("http://{addr}/generate_204"))
+            .await
+            .expect("best-effort bind proceeds when cellular is default route");
+        assert_eq!(outcome.status_code, 204);
+
+        // Wi-Fi default route (require_cellular_bind = true): refuses to leak over Wi-Fi.
+        pinger.set_require_cellular_bind(true);
+        let err = pinger
+            .probe_l2_head(&format!("http://{addr}/generate_204"))
+            .await
+            .expect_err("strict bind must refuse unbound probe while Wi-Fi is default");
+        assert!(matches!(err, ProbeFailure::BindUnavailable(_)));
     }
 }

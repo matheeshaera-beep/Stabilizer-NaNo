@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use pinger::{CellularPinger, ProbeTier, SocketBinder};
+use pinger::{CellularPinger, ProbeFailure, ProbeTier, SocketBinder};
 use state_machine::{Action, Event, PingReason, StateMachine};
 pub use state_machine::{
     LogLevel, RuntimeContext, StabilizerConfig, StabilizerProfile, StabilizerState,
@@ -549,6 +549,8 @@ impl StabilizerEngine {
             let prev_state = guard.sm.state();
             let prev_reason = guard.sm.state_reason().to_owned();
             let actions = guard.sm.handle_event(event);
+            self.pinger
+                .set_require_cellular_bind(guard.sm.context().is_wifi_default);
             let mut changed =
                 guard.sm.state() != prev_state || guard.sm.state_reason() != prev_reason;
             for action in &actions {
@@ -641,7 +643,6 @@ fn spawn_probe_shared(
             if guard.shut_down {
                 return;
             }
-            guard.total_pings = guard.total_pings.saturating_add(1);
             let label = match reason {
                 PingReason::Warmup => "Warmup",
                 PingReason::EcoTail => "EcoTail",
@@ -652,8 +653,9 @@ fn spawn_probe_shared(
                 PingReason::Recovery => "Recovery",
                 PingReason::OutageCheck => "OutageCheck",
             };
-            let ok = match &result {
+            let follow_event = match &result {
                 Ok(outcome) => {
+                    guard.total_pings = guard.total_pings.saturating_add(1);
                     guard.successful_pings = guard.successful_pings.saturating_add(1);
                     guard.last_ping_latency_ms = Some(outcome.latency_ms);
                     guard.total_probe_bytes = guard
@@ -671,20 +673,36 @@ fn spawn_probe_shared(
                             outcome.tier, outcome.latency_ms, outcome.bytes_estimated
                         ),
                     );
-                    true
+                    Event::ProbeCompleted {
+                        tier,
+                        reason,
+                        succeeded: true,
+                    }
                 }
-                Err(err_msg) => {
+                Err(ProbeFailure::BindUnavailable(msg)) => {
+                    let skip_msg = format!("{label} skipped: {msg}");
+                    let already_logged = guard
+                        .logs
+                        .back()
+                        .is_some_and(|entry| entry.message == skip_msg);
+                    if !already_logged {
+                        guard.push_log(LogLevel::Info, skip_msg);
+                    }
+                    Event::ProbeSkippedLocalBind { tier, reason }
+                }
+                Err(ProbeFailure::Network(err_msg)) => {
+                    guard.total_pings = guard.total_pings.saturating_add(1);
                     guard.failed_pings = guard.failed_pings.saturating_add(1);
                     guard.push_log(LogLevel::Warn, format!("{label} probe error: {err_msg}"));
-                    false
+                    Event::ProbeCompleted {
+                        tier,
+                        reason,
+                        succeeded: false,
+                    }
                 }
             };
 
-            let follow = guard.sm.handle_event(Event::ProbeCompleted {
-                tier,
-                reason,
-                succeeded: ok,
-            });
+            let follow = guard.sm.handle_event(follow_event);
             for action in &follow {
                 if let Action::Log(lvl, msg) = action {
                     guard.push_log(*lvl, msg.clone());
@@ -882,5 +900,141 @@ mod tests {
 
         engine.shutdown();
         let _ = server_thread.join();
+    }
+
+    struct BindFailingObserver {
+        revalidations: AtomicUsize,
+        root_requests: AtomicUsize,
+    }
+
+    impl BindFailingObserver {
+        fn new() -> Self {
+            Self {
+                revalidations: AtomicUsize::new(0),
+                root_requests: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl StabilizerObserver for BindFailingObserver {
+        fn on_telemetry_updated(&self, _snapshot: TelemetrySnapshot) {}
+
+        fn bind_socket_to_cellular(&self, _fd: i32) -> bool {
+            false
+        }
+
+        fn on_request_android_revalidation(&self) {
+            self.revalidations.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn on_request_root_recovery(&self) {
+            self.root_requests.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn on_calibration_finished(&self, _recommended_tail_secs: u64, _summary: String) {}
+    }
+
+    #[test]
+    fn failed_bind_on_cellular_default_does_not_abort_probes_or_trigger_root_recovery() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local tcp listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server_thread = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+
+        let observer = Arc::new(BindFailingObserver::new());
+        let cfg = StabilizerConfig {
+            ping_url: format!("http://{addr}/generate_204"),
+            root_recovery_enabled: true,
+            recovery_timeout_secs: 2,
+            ..StabilizerConfig::default()
+        };
+        let engine = StabilizerEngine::new(cfg, observer.clone()).expect("engine init");
+        engine.on_network_capabilities_changed(true, true);
+        engine.on_screen_state_changed(true, true);
+        engine.start();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let snap = engine.get_telemetry();
+            if snap.successful_pings >= 1 {
+                assert_eq!(snap.failed_pings, 0);
+                assert_eq!(snap.recoveries_triggered, 0);
+                assert_ne!(snap.state, StabilizerState::Outage);
+                assert_eq!(observer.root_requests.load(Ordering::Relaxed), 0);
+                assert_eq!(observer.revalidations.load(Ordering::Relaxed), 0);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "probe should proceed over cellular default when bind fails: {:?}",
+                snap.logs
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        engine.shutdown();
+        let _ = server_thread.join();
+    }
+
+    #[test]
+    fn failed_bind_on_wifi_default_skips_probe_without_root_recovery_or_outage() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local tcp listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        let observer = Arc::new(BindFailingObserver::new());
+        let cfg = StabilizerConfig {
+            ping_url: format!("http://{addr}/generate_204"),
+            root_recovery_enabled: true,
+            recovery_timeout_secs: 2,
+            ..StabilizerConfig::default()
+        };
+        let engine = StabilizerEngine::new(cfg, observer.clone()).expect("engine init");
+        engine.on_network_capabilities_changed(true, true);
+        engine.on_screen_state_changed(true, true);
+        engine.on_context_changed(RuntimeContext {
+            is_wifi_default: true,
+            hotspot_clients: 1,
+            ..RuntimeContext::default()
+        });
+        engine.start();
+        engine.probe_now();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let snap = engine.get_telemetry();
+            if snap.logs.iter().any(|l| l.message.contains("skipped:")) {
+                assert_eq!(snap.failed_pings, 0);
+                assert_eq!(snap.recoveries_triggered, 0);
+                assert_ne!(snap.state, StabilizerState::Outage);
+                assert_eq!(observer.root_requests.load(Ordering::Relaxed), 0);
+                assert_eq!(observer.revalidations.load(Ordering::Relaxed), 0);
+                assert!(
+                    listener.accept().is_err(),
+                    "must NOT leak probe onto default Wi-Fi socket"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "expected bind-unavailable skip log; got {:?}",
+                snap.logs
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        engine.shutdown();
     }
 }

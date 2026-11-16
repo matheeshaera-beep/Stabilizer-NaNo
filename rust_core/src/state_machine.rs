@@ -219,6 +219,10 @@ pub enum Event {
         reason: PingReason,
         succeeded: bool,
     },
+    ProbeSkippedLocalBind {
+        tier: ProbeTier,
+        reason: PingReason,
+    },
     TickElapsed {
         secs: u64,
     },
@@ -873,6 +877,20 @@ impl StateMachine {
                         ));
                         actions.push(Action::RequestAndroidRevalidation);
                     }
+                }
+            }
+            Event::ProbeSkippedLocalBind { tier: _, reason: _ } => {
+                if !self.is_running {
+                    return actions;
+                }
+                if self.is_quiet_forced()
+                    && !matches!(self.state, StabilizerState::Quiet | StabilizerState::Outage)
+                {
+                    self.transition_to(
+                        StabilizerState::Quiet,
+                        &self.quiet_reason_label(),
+                        &mut actions,
+                    );
                 }
             }
             Event::TickElapsed { secs } => {

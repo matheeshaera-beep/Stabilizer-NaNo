@@ -38,6 +38,7 @@ import com.stabilizernano.app.MainActivity
 import com.stabilizernano.app.R
 import com.stabilizernano.app.data.CellularNetworkDelegate
 import com.stabilizernano.app.data.StabilizerRepository
+import com.stabilizernano.uniffi.LogLevel
 import com.stabilizernano.uniffi.RuntimeContext
 import com.stabilizernano.uniffi.StabilizerEngine
 import com.stabilizernano.uniffi.StabilizerState
@@ -57,7 +58,14 @@ import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+
+private data class CellularNetworkEntry(
+    val hasInternet: Boolean,
+    val isValidated: Boolean,
+    val seenSeq: Long
+)
 
 class StabilizerForegroundService : Service(), CellularNetworkDelegate {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -66,11 +74,13 @@ class StabilizerForegroundService : Service(), CellularNetworkDelegate {
     private lateinit var connectivityManager: ConnectivityManager
     private lateinit var tetheringDetector: TetheringDetector
 
-    private val cellularNetworks = ConcurrentHashMap<Network, Pair<Boolean, Boolean>>()
+    private val cellularNetworks = ConcurrentHashMap<Network, CellularNetworkEntry>()
+    private val cellularSeenSeq = AtomicLong(0L)
     private val preferredCellularNetwork = AtomicReference<Network?>(null)
     private val isWifiDefaultRoute = AtomicBoolean(false)
     private val boostActiveFlag = AtomicBoolean(false)
     private val samplerWakeSignal = Channel<Unit>(Channel.CONFLATED)
+    private val lastBindErrorLogAtMs = AtomicLong(0L)
 
     private var listenersRegistered = false
     private var trafficJob: Job? = null
@@ -111,7 +121,16 @@ class StabilizerForegroundService : Service(), CellularNetworkDelegate {
     private val cellularCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
             val caps = connectivityManager.getNetworkCapabilities(network)
-            updateNetworkEntry(network, caps)
+            if (caps != null) {
+                updateNetworkEntry(network, caps)
+            } else if (!cellularNetworks.containsKey(network)) {
+                cellularNetworks[network] = CellularNetworkEntry(
+                    hasInternet = true,
+                    isValidated = false,
+                    seenSeq = cellularSeenSeq.incrementAndGet()
+                )
+                dispatchAggregatedNetworkState()
+            }
         }
 
         override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
@@ -184,17 +203,46 @@ class StabilizerForegroundService : Service(), CellularNetworkDelegate {
     }
 
     override fun bindCellularSocketFd(fd: Int): Boolean {
-        val cellularNet = preferredCellularNetwork.get() ?: return false
-        return runCatching {
-            ParcelFileDescriptor.fromFd(fd).use { dupFd ->
-                cellularNet.bindSocket(dupFd.fileDescriptor)
+        val candidates = resolveCandidateCellularNetworks()
+        if (candidates.isEmpty()) {
+            logBindFailureThrottled(
+                "Socket bind skipped: no active cellular Network handle (wifiDefault=${isWifiDefaultRoute.get()})"
+            )
+            return false
+        }
+
+        var lastError: String? = null
+        var cacheInvalidated = false
+        for (cellularNet in candidates) {
+            try {
+                ParcelFileDescriptor.fromFd(fd).use { dupFd ->
+                    cellularNet.bindSocket(dupFd.fileDescriptor)
+                }
+                if (preferredCellularNetwork.get() != cellularNet) {
+                    preferredCellularNetwork.set(cellularNet)
+                }
+                return true
+            } catch (ex: Throwable) {
+                lastError = "${ex.javaClass.simpleName}: ${ex.message}"
+                if (connectivityManager.getNetworkCapabilities(cellularNet) == null) {
+                    cellularNetworks.remove(cellularNet)
+                    cacheInvalidated = true
+                }
             }
-            true
-        }.getOrDefault(false)
+        }
+        if (cacheInvalidated) {
+            dispatchAggregatedNetworkState()
+        }
+        logBindFailureThrottled(
+            "Socket bind failed across ${candidates.size} handle(s) (wifiDefault=${isWifiDefaultRoute.get()}): $lastError"
+        )
+        return false
     }
 
     override fun requestAndroidRevalidation() {
-        val cellularNet = preferredCellularNetwork.get() ?: return
+        val cellularNet = preferredCellularNetwork.get()
+            ?: resolveCandidateCellularNetworks().firstOrNull()
+            ?: return
         runCatching {
             @Suppress("DEPRECATION")
             connectivityManager.reportNetworkConnectivity(cellularNet, false)
@@ -368,11 +416,13 @@ class StabilizerForegroundService : Service(), CellularNetworkDelegate {
         @Suppress("DEPRECATION")
         for (network in connectivityManager.allNetworks) {
             val caps = connectivityManager.getNetworkCapabilities(network) ?: continue
-            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) &&
-                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-            ) {
+            if (isBindableCellularCaps(caps)) {
                 val validated = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
-                cellularNetworks[network] = true to validated
+                cellularNetworks[network] = CellularNetworkEntry(
+                    hasInternet = true,
+                    isValidated = validated,
+                    seenSeq = cellularSeenSeq.incrementAndGet()
+                )
             }
         }
         dispatchAggregatedNetworkState()
@@ -392,28 +442,86 @@ class StabilizerForegroundService : Service(), CellularNetworkDelegate {
     }
 
     private fun updateNetworkEntry(network: Network, caps: NetworkCapabilities?) {
-        if (caps == null || !caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
+        if (caps == null ||
+            !caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ||
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+        ) {
             cellularNetworks.remove(network)
         } else {
             val hasInternet = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             val isValidated = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
-            cellularNetworks[network] = hasInternet to isValidated
+            cellularNetworks[network] = CellularNetworkEntry(
+                hasInternet = hasInternet,
+                isValidated = isValidated,
+                seenSeq = cellularSeenSeq.incrementAndGet()
+            )
         }
         dispatchAggregatedNetworkState()
     }
 
     private fun dispatchAggregatedNetworkState() {
         val entries = cellularNetworks.entries.toList()
-        val bestNetwork = entries.firstOrNull { it.value.first && it.value.second }?.key
-            ?: entries.firstOrNull { it.value.first }?.key
+        val bestNetwork = entries
+            .filter { it.value.hasInternet }
+            .maxWithOrNull(
+                compareBy<Map.Entry<Network, CellularNetworkEntry>> { it.value.isValidated }
+                    .thenBy { it.value.seenSeq }
+            )
+            ?.key
         preferredCellularNetwork.set(bestNetwork)
 
-        val hasInternet = entries.any { it.value.first }
-        val isValidated = entries.any { it.value.first && it.value.second }
+        val hasInternet = entries.any { it.value.hasInternet }
+        val isValidated = entries.any { it.value.hasInternet && it.value.isValidated }
         val netCaps = hasInternet to isValidated
         if (netCaps != lastDispatchedNetCaps) {
             lastDispatchedNetCaps = netCaps
             engine.onNetworkCapabilitiesChanged(hasInternet = hasInternet, isValidated = isValidated)
+        }
+    }
+
+    private fun resolveCandidateCellularNetworks(): List<Network> {
+        val ordered = LinkedHashSet<Network>()
+        preferredCellularNetwork.get()?.let { ordered.add(it) }
+
+        cellularNetworks.entries
+            .filter { it.value.hasInternet }
+            .sortedWith(
+                compareByDescending<Map.Entry<Network, CellularNetworkEntry>> { it.value.isValidated }
+                    .thenByDescending { it.value.seenSeq }
+            )
+            .forEach { ordered.add(it.key) }
+
+        connectivityManager.activeNetwork?.let { active ->
+            val caps = connectivityManager.getNetworkCapabilities(active)
+            if (caps != null && isBindableCellularCaps(caps)) {
+                ordered.add(active)
+            }
+        }
+
+        @Suppress("DEPRECATION")
+        for (network in connectivityManager.allNetworks) {
+            val caps = connectivityManager.getNetworkCapabilities(network) ?: continue
+            if (isBindableCellularCaps(caps)) {
+                ordered.add(network)
+            }
+        }
+
+        return ordered.toList()
+    }
+
+    private fun isBindableCellularCaps(caps: NetworkCapabilities): Boolean {
+        return caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) &&
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+    }
+
+    private fun logBindFailureThrottled(message: String) {
+        val now = SystemClock.elapsedRealtime()
+        val prev = lastBindErrorLogAtMs.get()
+        if (prev == 0L || now - prev >= 60_000L) {
+            if (lastBindErrorLogAtMs.compareAndSet(prev, now)) {
+                StabilizerRepository.appendLocalLog(LogLevel.WARN, message)
+            }
         }
     }
 
