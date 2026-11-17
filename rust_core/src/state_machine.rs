@@ -10,13 +10,13 @@ pub const ACTIVE_RX_THRESHOLD_BYTES_PER_SEC: u64 = 1_024;
 pub const HEAVY_DOWNLOAD_BYTES_PER_SEC: u64 = 4_096;
 
 /// Minimum sustained outbound traffic (bytes/sec) while RX is stalled to flag a silent freeze.
-pub const STALL_TX_THRESHOLD_BYTES_PER_SEC: u64 = 256;
+pub const STALL_TX_THRESHOLD_BYTES_PER_SEC: u64 = 128;
 
-/// Upper bound on RX (bytes/sec) considered "no progress" during a TX stall (avoids false positives on small ACKs? No: slow uploads receive >64 B/s ACKs).
+/// Upper bound on RX (bytes/sec) considered "no progress" during a TX stall (slow uploads receive >= 64 B/s ACKs).
 pub const STALL_RX_CEILING_BYTES_PER_SEC: u64 = 64;
 
-/// Consecutive seconds of `TX >= 256 && RX < 64` before firing an instant stall-heal probe.
-pub const STALL_CONSECUTIVE_SECS: u64 = 3;
+/// Consecutive seconds of `TX >= 128 && RX < 64` before firing an instant stall-heal probe.
+pub const STALL_CONSECUTIVE_SECS: u64 = 2;
 
 /// Grace period (seconds) before dropping from `Active` to `Quiet` after a screen-off download stops.
 pub const SCREEN_OFF_DOWNLOAD_GRACE_SECS: u64 = 8;
@@ -252,6 +252,7 @@ pub struct StateMachine {
     recovering_secs: u64,
     android_revalidation_sent: bool,
     root_recovery_sent_this_episode: bool,
+    post_root_settle_until_uptime_secs: u64,
     root_recovery_history_secs: VecDeque<u64>,
     consecutive_failed_ladders: u8,
     outage_backoff_step: u8,
@@ -260,6 +261,7 @@ pub struct StateMachine {
     rx_history: [bool; 3],
     rx_history_idx: usize,
     recent_rx_active_this_tick: bool,
+    was_heavy_rx_prev_tick: bool,
     warmup_just_entered: bool,
     last_rx_bytes_per_sec: u64,
     last_tx_bytes_per_sec: u64,
@@ -296,6 +298,7 @@ impl StateMachine {
             recovering_secs: 0,
             android_revalidation_sent: false,
             root_recovery_sent_this_episode: false,
+            post_root_settle_until_uptime_secs: 0,
             root_recovery_history_secs: VecDeque::new(),
             consecutive_failed_ladders: 0,
             outage_backoff_step: 0,
@@ -303,6 +306,7 @@ impl StateMachine {
             rx_history: [false; 3],
             rx_history_idx: 0,
             recent_rx_active_this_tick: false,
+            was_heavy_rx_prev_tick: false,
             warmup_just_entered: false,
             last_rx_bytes_per_sec: 0,
             last_tx_bytes_per_sec: 0,
@@ -691,18 +695,21 @@ impl StateMachine {
                 }
 
                 if has_internet && !is_validated {
-                    if !matches!(
-                        self.state,
-                        StabilizerState::Quiet
-                            | StabilizerState::Recovering
-                            | StabilizerState::Outage
-                    ) {
+                    if self.uptime_secs >= self.post_root_settle_until_uptime_secs
+                        && !matches!(
+                            self.state,
+                            StabilizerState::Quiet
+                                | StabilizerState::Recovering
+                                | StabilizerState::Outage
+                        )
+                    {
                         self.enter_recovering("Lost NET_CAPABILITY_VALIDATED", &mut actions);
                     }
                 } else if has_internet && is_validated {
                     self.consecutive_failed_ladders = 0;
                     self.outage_backoff_step = 0;
                     self.outage_wait_secs = 0;
+                    self.post_root_settle_until_uptime_secs = 0;
                     if !had_validated
                         && matches!(
                             self.state,
@@ -743,7 +750,11 @@ impl StateMachine {
                 if self.context.is_wifi_default && !self.context.has_active_tethering() {
                     return actions;
                 }
-                if self.state == StabilizerState::Active {
+                if self.state == StabilizerState::Recovering {
+                    return actions;
+                }
+                let is_link_disruption = reason.contains("blocked") || reason.contains("Link");
+                if self.state == StabilizerState::Active && !is_link_disruption {
                     return actions;
                 }
                 self.secs_since_last_probe = 0;
@@ -789,6 +800,9 @@ impl StateMachine {
                     self.stall_secs = 0;
                     self.eco_checks_sent = 0;
                     self.recent_rx_active_this_tick = true;
+                    if rx_bytes_delta >= HEAVY_DOWNLOAD_BYTES_PER_SEC {
+                        self.was_heavy_rx_prev_tick = true;
+                    }
 
                     if !matches!(
                         self.state,
@@ -814,9 +828,15 @@ impl StateMachine {
                 // Silent link-freeze check: sustained outbound attempts/retransmits with ~zero RX.
                 let is_tx_stalled = tx_bytes_delta >= STALL_TX_THRESHOLD_BYTES_PER_SEC
                     && rx_bytes_delta < STALL_RX_CEILING_BYTES_PER_SEC;
-                if !is_tx_stalled {
+                if is_tx_stalled {
+                    // Sudden cliff from >= 4 KB/s download straight into TX-only freeze gets a 1s head start.
+                    if self.was_heavy_rx_prev_tick {
+                        self.stall_secs = self.stall_secs.max(1);
+                    }
+                } else {
                     self.stall_secs = 0;
                 }
+                self.was_heavy_rx_prev_tick = false;
             }
             Event::ProbeCompleted {
                 tier,
@@ -852,12 +872,14 @@ impl StateMachine {
                         );
                     }
                 } else {
-                    // L1 failure or StallCheck failure escalates into Recovering immediately.
+                    // Any live/tail/warmup probe failure escalates into Recovering immediately,
+                    // even if a residual traffic tick flickered state into Active while in flight.
                     if matches!(
                         self.state,
                         StabilizerState::Warmup
                             | StabilizerState::EcoTailCheck
                             | StabilizerState::LiveKeepalive
+                            | StabilizerState::Active
                     ) && !self.context.is_wifi_default
                         && self.has_internet
                     {
@@ -927,7 +949,7 @@ impl StateMachine {
                     return actions;
                 }
 
-                // Stall counter evaluation when TX > 0 and RX < 64 B/s.
+                // Stall counter evaluation when TX >= 128 B/s and RX < 64 B/s.
                 let is_tx_stalled = self.last_tx_bytes_per_sec >= STALL_TX_THRESHOLD_BYTES_PER_SEC
                     && self.last_rx_bytes_per_sec < STALL_RX_CEILING_BYTES_PER_SEC;
                 if is_tx_stalled
@@ -942,7 +964,7 @@ impl StateMachine {
                         self.stall_secs = 0;
                         self.stalls_detected = self.stalls_detected.saturating_add(1);
                         self.enter_recovering(
-                            "Silent TX stall detected (RX stalled 3s)",
+                            "Silent TX stall detected (RX stalled 2s)",
                             &mut actions,
                         );
                         return actions;
@@ -1036,7 +1058,9 @@ impl StateMachine {
                 }
 
                 if !self.is_validated {
-                    self.enter_recovering("Unvalidated cellular link", &mut actions);
+                    if self.uptime_secs >= self.post_root_settle_until_uptime_secs {
+                        self.enter_recovering("Unvalidated cellular link", &mut actions);
+                    }
                     return actions;
                 }
 
@@ -1048,6 +1072,9 @@ impl StateMachine {
                 if self.is_live_eligible() {
                     let label = self.live_reason_label();
                     if self.state != StabilizerState::LiveKeepalive {
+                        // Align probe cadence with idle time since traffic stopped so the first
+                        // keepalive lands inside `radio_tail_secs` instead of waiting idle + full interval.
+                        self.secs_since_last_probe = self.secs_since_last_probe.max(self.idle_secs);
                         self.transition_to(StabilizerState::LiveKeepalive, &label, &mut actions);
                     } else {
                         self.state_reason = label;
@@ -1082,7 +1109,12 @@ impl StateMachine {
 
                 if self.eco_checks_sent < MAX_ECO_TAIL_CHECKS {
                     let eco_step_secs = (self.config.radio_tail_secs / 2).max(3);
-                    if self.secs_since_last_probe >= eco_step_secs {
+                    let elapsed_for_eco = if self.eco_checks_sent == 0 {
+                        self.secs_since_last_probe.max(self.idle_secs)
+                    } else {
+                        self.secs_since_last_probe
+                    };
+                    if elapsed_for_eco >= eco_step_secs {
                         self.secs_since_last_probe = 0;
                         self.eco_checks_sent = self.eco_checks_sent.saturating_add(1);
                         let check_num = self.eco_checks_sent;
@@ -1143,6 +1175,7 @@ impl StateMachine {
         if self.recovering_secs >= effective_timeout && !self.root_recovery_sent_this_episode {
             if self.can_trigger_root_recovery() {
                 self.root_recovery_sent_this_episode = true;
+                self.post_root_settle_until_uptime_secs = self.uptime_secs.saturating_add(10);
                 self.root_recovery_history_secs.push_back(self.uptime_secs);
                 self.recoveries_triggered = self.recoveries_triggered.saturating_add(1);
                 actions.push(Action::Log(
@@ -1237,6 +1270,8 @@ impl StateMachine {
         self.secs_since_l2_verify = 0;
         self.eco_checks_sent = 0;
         self.recent_rx_active_this_tick = false;
+        self.was_heavy_rx_prev_tick = false;
+        self.post_root_settle_until_uptime_secs = 0;
         self.reset_recovery_episode();
     }
 
@@ -1752,5 +1787,181 @@ mod tests {
         let cfg_actions = sm.update_config(live_cfg);
         assert_eq!(sm.state(), StabilizerState::LiveKeepalive);
         assert_eq!(count_probes(&cfg_actions), 1);
+    }
+
+    #[test]
+    fn probe_failure_during_active_flicker_still_enters_recovering() {
+        let mut sm = started_machine(StabilizerProfile::Live);
+        // Move into Active via strong RX.
+        sm.handle_event(Event::TrafficObserved {
+            rx_bytes_delta: 6_000,
+            tx_bytes_delta: 300,
+        });
+        sm.handle_event(Event::TickElapsed { secs: 1 });
+        assert_eq!(sm.state(), StabilizerState::Active);
+
+        // An in-flight LiveKeepalive/Warmup probe timing out must still trigger Recovering.
+        let fail_actions = sm.handle_event(Event::ProbeCompleted {
+            tier: ProbeTier::L1Dns,
+            reason: PingReason::LiveKeepalive,
+            succeeded: false,
+        });
+        assert_eq!(sm.state(), StabilizerState::Recovering);
+        assert!(fail_actions.iter().any(|a| matches!(
+            a,
+            Action::SendProbe {
+                tier: ProbeTier::L2HttpHead,
+                reason: PingReason::StallCheck
+            }
+        )));
+    }
+
+    #[test]
+    fn heavy_rx_cliff_triggers_fast_stall_without_slow_upload_false_positive() {
+        let mut sm = started_machine(StabilizerProfile::Auto);
+        // Heavy download burst (>= 4 KB/s).
+        sm.handle_event(Event::TrafficObserved {
+            rx_bytes_delta: 16_384,
+            tx_bytes_delta: 500,
+        });
+        sm.handle_event(Event::TickElapsed { secs: 1 });
+        assert_eq!(sm.state(), StabilizerState::Active);
+
+        // Slow upload with steady TCP ACKs (>= 64 B/s RX) does NOT false-stall even above 128 B/s TX.
+        for _ in 0..5 {
+            sm.handle_event(Event::TrafficObserved {
+                rx_bytes_delta: 80,
+                tx_bytes_delta: 400,
+            });
+            sm.handle_event(Event::TickElapsed { secs: 1 });
+            assert_ne!(sm.state(), StabilizerState::Recovering);
+        }
+
+        // Re-establish heavy download burst then drop straight into a 150 B/s TX-only freeze.
+        sm.handle_event(Event::TrafficObserved {
+            rx_bytes_delta: 12_000,
+            tx_bytes_delta: 400,
+        });
+        sm.handle_event(Event::TickElapsed { secs: 1 });
+
+        sm.handle_event(Event::TrafficObserved {
+            rx_bytes_delta: 0,
+            tx_bytes_delta: 150,
+        });
+        let a = sm.handle_event(Event::TickElapsed { secs: 1 });
+        assert_eq!(sm.state(), StabilizerState::Recovering);
+        assert!(a.iter().any(|act| matches!(
+            act,
+            Action::SendProbe {
+                tier: ProbeTier::L2HttpHead,
+                reason: PingReason::StallCheck
+            }
+        )));
+    }
+
+    #[test]
+    fn post_root_settle_window_prevents_premature_unvalidated_recovery() {
+        let cfg = StabilizerConfig {
+            profile: StabilizerProfile::Live,
+            root_recovery_enabled: true,
+            recovery_timeout_secs: 5,
+            ..StabilizerConfig::default()
+        };
+        let mut sm = StateMachine::new(cfg);
+        sm.handle_event(Event::NetworkCapabilitiesChanged {
+            has_internet: true,
+            is_validated: true,
+        });
+        sm.handle_event(Event::ScreenChanged {
+            is_screen_on: true,
+            is_unlocked: true,
+        });
+        sm.handle_event(Event::Start);
+
+        // Drop validation to trigger Step 3 root toggle at t=5s.
+        sm.handle_event(Event::NetworkCapabilitiesChanged {
+            has_internet: true,
+            is_validated: false,
+        });
+        let mut root_triggered = false;
+        for _ in 0..5 {
+            let a = sm.handle_event(Event::TickElapsed { secs: 1 });
+            if a.contains(&Action::TriggerRootRecovery) {
+                root_triggered = true;
+            }
+        }
+        assert!(root_triggered);
+
+        // If an L2 probe succeeds while Android validation is still catching up during the 10s
+        // settle window, Losing/Staying !is_validated must NOT immediately yank back into Recovering.
+        sm.handle_event(Event::ProbeCompleted {
+            tier: ProbeTier::L2HttpHead,
+            reason: PingReason::Recovery,
+            succeeded: true,
+        });
+        assert_ne!(sm.state(), StabilizerState::Recovering);
+
+        for _ in 0..5 {
+            sm.handle_event(Event::TickElapsed { secs: 1 });
+            assert_ne!(
+                sm.state(),
+                StabilizerState::Recovering,
+                "must let modem reattach inside post-root settle window"
+            );
+        }
+
+        // Once the 10s settle window passes while still !is_validated, recovery resumes cleanly.
+        for _ in 0..6 {
+            sm.handle_event(Event::TickElapsed { secs: 1 });
+        }
+        assert_eq!(sm.state(), StabilizerState::Recovering);
+    }
+
+    #[test]
+    fn live_keepalive_first_probe_aligns_with_radio_tail() {
+        let cfg = StabilizerConfig {
+            profile: StabilizerProfile::Live,
+            radio_tail_secs: 8,
+            idle_threshold_secs: 4,
+            ..StabilizerConfig::default()
+        };
+        let mut sm = StateMachine::new(cfg);
+        sm.handle_event(Event::NetworkCapabilitiesChanged {
+            has_internet: true,
+            is_validated: true,
+        });
+        sm.handle_event(Event::ScreenChanged {
+            is_screen_on: true,
+            is_unlocked: true,
+        });
+        sm.handle_event(Event::Start);
+
+        // Drive Active via RX burst.
+        sm.handle_event(Event::TrafficObserved {
+            rx_bytes_delta: 8_000,
+            tx_bytes_delta: 400,
+        });
+        sm.handle_event(Event::TickElapsed { secs: 1 });
+        assert_eq!(sm.state(), StabilizerState::Active);
+
+        // Wait idle: the first LiveKeepalive probe must fire within radio_tail_secs (<= 8s),
+        // rather than idle_threshold_secs (4s) + full interval (~6s) = 10s.
+        let mut secs_until_first_probe = None;
+        for sec in 1..=8 {
+            sm.handle_event(Event::TrafficObserved {
+                rx_bytes_delta: 0,
+                tx_bytes_delta: 0,
+            });
+            let a = sm.handle_event(Event::TickElapsed { secs: 1 });
+            if count_probes(&a) > 0 && secs_until_first_probe.is_none() {
+                secs_until_first_probe = Some(sec);
+            }
+        }
+        let fired_at =
+            secs_until_first_probe.expect("LiveKeepalive probe should fire within 8s tail");
+        assert!(
+            fired_at <= 8,
+            "first keepalive fired at {fired_at}s (past 8s RRC tail)"
+        );
     }
 }

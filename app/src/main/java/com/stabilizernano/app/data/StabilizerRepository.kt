@@ -31,6 +31,7 @@ interface CellularNetworkDelegate {
     fun requestAndroidRevalidation()
     fun onBoostStateUpdated(active: Boolean)
     fun wakeSampler()
+    fun onRootRecoveryTriggered()
 }
 
 object StabilizerRepository : StabilizerObserver {
@@ -277,6 +278,7 @@ object StabilizerRepository : StabilizerObserver {
 
     override fun onRequestRootRecovery() {
         appendLocalLog(LogLevel.WARN, "Step 3: executing gated root cellular toggle...")
+        networkDelegate?.onRootRecoveryTriggered()
         scope.launch {
             val result = RootRecoveryHelper.toggleMobileDataAsRoot()
             result.onSuccess { msg ->

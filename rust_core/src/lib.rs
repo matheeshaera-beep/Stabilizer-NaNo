@@ -141,7 +141,13 @@ impl EngineInner {
             return 5_000;
         }
         match self.sm.state() {
-            StabilizerState::Quiet | StabilizerState::Outage => 10_000,
+            StabilizerState::Quiet | StabilizerState::Outage => {
+                if self.sm.is_screen_on() || self.sm.is_tethering() {
+                    2_000
+                } else {
+                    10_000
+                }
+            }
             StabilizerState::LiveKeepalive | StabilizerState::Recovering
                 if !self.sm.is_screen_on() =>
             {
@@ -1034,6 +1040,39 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+
+        engine.shutdown();
+    }
+
+    #[test]
+    fn screen_on_quiet_samples_every_2s_while_screen_off_sleeps_10s() {
+        let observer = Arc::new(TestObserver::new());
+        let cfg = StabilizerConfig {
+            profile: StabilizerProfile::Eco,
+            ..StabilizerConfig::default()
+        };
+        let engine = StabilizerEngine::new(cfg, observer).expect("engine init");
+        engine.on_network_capabilities_changed(true, true);
+        engine.on_context_changed(RuntimeContext {
+            low_battery_or_saver: true,
+            ..RuntimeContext::default()
+        });
+        engine.on_screen_state_changed(true, true);
+        engine.start();
+
+        // Advance past idle threshold into Quiet while screen is ON -> 2s TrafficStats sampling.
+        for _ in 0..5 {
+            engine.on_sampling_tick(1, 0, 0);
+        }
+        let quiet_on = engine.get_telemetry();
+        assert_eq!(quiet_on.state, StabilizerState::Quiet);
+        assert_eq!(quiet_on.recommended_sample_ms, 2_000);
+
+        // Turn screen OFF -> deep 10s sleep while Quiet.
+        engine.on_screen_state_changed(false, false);
+        let quiet_off = engine.get_telemetry();
+        assert_eq!(quiet_off.state, StabilizerState::Quiet);
+        assert_eq!(quiet_off.recommended_sample_ms, 10_000);
 
         engine.shutdown();
     }

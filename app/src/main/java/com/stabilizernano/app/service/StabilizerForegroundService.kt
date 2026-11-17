@@ -81,13 +81,14 @@ class StabilizerForegroundService : Service(), CellularNetworkDelegate {
     private val boostActiveFlag = AtomicBoolean(false)
     private val samplerWakeSignal = Channel<Unit>(Channel.CONFLATED)
     private val lastBindErrorLogAtMs = AtomicLong(0L)
+    private val rebaseTrafficCounters = AtomicBoolean(false)
 
     private var listenersRegistered = false
     private var trafficJob: Job? = null
     private var notificationJob: Job? = null
     private var lastDispatchedContext: RuntimeContext? = null
     private var lastDispatchedNetCaps: Pair<Boolean, Boolean>? = null
-    private var lastInterfaceSignature: String? = null
+    private var lastLinkSignature: String? = null
     private var lastDisplayOverrideNetwork: Int? = null
     private var telephonyCallback: Any? = null
     private var subscriptionListener: SubscriptionManager.OnSubscriptionsChangedListener? = null
@@ -138,18 +139,42 @@ class StabilizerForegroundService : Service(), CellularNetworkDelegate {
         }
 
         override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+            val preferred = preferredCellularNetwork.get()
+            if (preferred != null && preferred != network) return
             val iface = linkProperties.interfaceName ?: return
-            val prev = lastInterfaceSignature
-            lastInterfaceSignature = iface
-            if (prev != null && prev != iface) {
+            val addrs = linkProperties.linkAddresses
+                .mapNotNull { it.address.hostAddress }
+                .sorted()
+                .joinToString(",")
+            val dns = linkProperties.dnsServers
+                .mapNotNull { it.hostAddress }
+                .sorted()
+                .joinToString(",")
+            val sig = "$iface|$addrs|$dns"
+            val prev = lastLinkSignature
+            lastLinkSignature = sig
+            if (prev != null && prev != sig) {
                 engine.onRadioTopologyChanged("Link change ($iface)")
+                samplerWakeSignal.trySend(Unit)
             }
+        }
+
+        override fun onBlockedStatusChanged(network: Network, blocked: Boolean) {
+            val preferred = preferredCellularNetwork.get()
+            if (preferred != null && preferred != network) return
+            engine.onRadioTopologyChanged(
+                if (blocked) "Cellular blocked by OS/modem" else "Cellular unblocked"
+            )
+            samplerWakeSignal.trySend(Unit)
         }
 
         override fun onLost(network: Network) {
             cellularNetworks.remove(network)
             if (preferredCellularNetwork.get() == network) {
                 preferredCellularNetwork.set(null)
+            }
+            if (cellularNetworks.isEmpty()) {
+                rebaseTrafficCounters.set(true)
             }
             dispatchAggregatedNetworkState()
         }
@@ -263,6 +288,10 @@ class StabilizerForegroundService : Service(), CellularNetworkDelegate {
         samplerWakeSignal.trySend(Unit)
     }
 
+    override fun onRootRecoveryTriggered() {
+        rebaseTrafficCounters.set(true)
+    }
+
     private fun startMonitoring() {
         boostActiveFlag.set(StabilizerRepository.boostRemainingMinutes.value > 0)
         registerSystemListeners()
@@ -327,6 +356,8 @@ class StabilizerForegroundService : Service(), CellularNetworkDelegate {
         preferredCellularNetwork.set(null)
         lastDispatchedContext = null
         lastDispatchedNetCaps = null
+        lastLinkSignature = null
+        rebaseTrafficCounters.set(false)
         listenersRegistered = false
     }
 
@@ -472,10 +503,14 @@ class StabilizerForegroundService : Service(), CellularNetworkDelegate {
 
         val hasInternet = entries.any { it.value.hasInternet }
         val isValidated = entries.any { it.value.hasInternet && it.value.isValidated }
+        if (!hasInternet) {
+            rebaseTrafficCounters.set(true)
+        }
         val netCaps = hasInternet to isValidated
         if (netCaps != lastDispatchedNetCaps) {
             lastDispatchedNetCaps = netCaps
             engine.onNetworkCapabilitiesChanged(hasInternet = hasInternet, isValidated = isValidated)
+            samplerWakeSignal.trySend(Unit)
         }
     }
 
@@ -595,9 +630,9 @@ class StabilizerForegroundService : Service(), CellularNetworkDelegate {
                 }
 
                 val nowMs = SystemClock.elapsedRealtime()
-                val elapsedSecs = ((nowMs - lastSampleAtMs + 500L) / 1_000L)
+                val elapsedSecsLong = ((nowMs - lastSampleAtMs + 500L) / 1_000L)
                     .coerceAtLeast(1L)
-                    .toULong()
+                val elapsedSecs = elapsedSecsLong.toULong()
                 lastSampleAtMs = nowMs
                 val currMobileRx = readMobileRxBytes()
                 val currMobileTx = readMobileTxBytes()
@@ -613,20 +648,55 @@ class StabilizerForegroundService : Service(), CellularNetworkDelegate {
                     null
                 }
 
-                val mobileRxDelta = nonNegativeDelta(prevMobileRx, currMobileRx)
-                val mobileTxDelta = nonNegativeDelta(prevMobileTx, currMobileTx)
-                val ownRxDelta = nonNegativeDelta(prevOwnRx, currOwnRx)
-                val ownTxDelta = nonNegativeDelta(prevOwnTx, currOwnTx)
-
-                val tetherRxDelta = if (prevTetherTraffic != null && currTetherTraffic != null) {
-                    nonNegativeDelta(prevTetherTraffic.rxBytes, currTetherTraffic.rxBytes)
+                val forceRebase = rebaseTrafficCounters.compareAndSet(true, false)
+                val mobileRxDelta = if (forceRebase) {
+                    null
                 } else {
-                    0L
+                    safeTrafficDelta(prevMobileRx, currMobileRx, elapsedSecsLong)
                 }
-                val tetherTxDelta = if (prevTetherTraffic != null && currTetherTraffic != null) {
-                    nonNegativeDelta(prevTetherTraffic.txBytes, currTetherTraffic.txBytes)
+                val mobileTxDelta = if (forceRebase) {
+                    null
                 } else {
-                    0L
+                    safeTrafficDelta(prevMobileTx, currMobileTx, elapsedSecsLong)
+                }
+
+                val finalRx: Long
+                val finalTx: Long
+                if (mobileRxDelta == null || mobileTxDelta == null) {
+                    // Cleanly rebase all counters so radio resets or cumulative counter restores
+                    // never emit multi-GB ghost RX spikes.
+                    finalRx = 0L
+                    finalTx = 0L
+                } else {
+                    val ownRxDelta = nonNegativeDelta(prevOwnRx, currOwnRx)
+                    val ownTxDelta = nonNegativeDelta(prevOwnTx, currOwnTx)
+
+                    val tetherRxDelta = if (prevTetherTraffic != null && currTetherTraffic != null) {
+                        safeTrafficDelta(
+                            prevTetherTraffic.rxBytes,
+                            currTetherTraffic.rxBytes,
+                            elapsedSecsLong
+                        ) ?: 0L
+                    } else {
+                        0L
+                    }
+                    val tetherTxDelta = if (prevTetherTraffic != null && currTetherTraffic != null) {
+                        safeTrafficDelta(
+                            prevTetherTraffic.txBytes,
+                            currTetherTraffic.txBytes,
+                            elapsedSecsLong
+                        ) ?: 0L
+                    } else {
+                        0L
+                    }
+
+                    val extRx = (mobileRxDelta - ownRxDelta).coerceAtLeast(0L)
+                    val extTx = (mobileTxDelta - ownTxDelta).coerceAtLeast(0L)
+
+                    // Hardware offload / bridged interfaces swap direction cleanly on upstream vs downstream,
+                    // so take max against tether deltas when clients are active.
+                    finalRx = if (tetherStatus.isTetheringActive) maxOf(extRx, tetherTxDelta) else extRx
+                    finalTx = if (tetherStatus.isTetheringActive) maxOf(extTx, tetherRxDelta) else extTx
                 }
 
                 prevMobileRx = currMobileRx
@@ -634,14 +704,6 @@ class StabilizerForegroundService : Service(), CellularNetworkDelegate {
                 prevOwnRx = currOwnRx
                 prevOwnTx = currOwnTx
                 prevTetherTraffic = currTetherTraffic
-
-                val extRx = (mobileRxDelta - ownRxDelta).coerceAtLeast(0L)
-                val extTx = (mobileTxDelta - ownTxDelta).coerceAtLeast(0L)
-
-                // Hardware offload / bridged interfaces swap direction cleanly on upstream vs downstream,
-                // so take max against tether deltas when clients are active.
-                val finalRx = if (tetherStatus.isTetheringActive) maxOf(extRx, tetherTxDelta) else extRx
-                val finalTx = if (tetherStatus.isTetheringActive) maxOf(extTx, tetherRxDelta) else extTx
 
                 engine.onSamplingTick(
                     elapsedSecs = elapsedSecs,
@@ -733,6 +795,14 @@ class StabilizerForegroundService : Service(), CellularNetworkDelegate {
     private fun isKeyguardLocked(): Boolean {
         val km = getSystemService(KeyguardManager::class.java)
         return km?.isKeyguardLocked ?: false
+    }
+
+    private fun safeTrafficDelta(prev: Long, curr: Long, elapsedSecs: Long): Long? {
+        if (prev < 0L || curr < 0L || curr < prev) return null
+        val diff = curr - prev
+        if (prev == 0L && diff > 20_000_000L) return null
+        if (diff > 150_000_000L * elapsedSecs.coerceAtLeast(1L)) return null
+        return diff
     }
 
     private fun nonNegativeDelta(prev: Long, curr: Long): Long {
