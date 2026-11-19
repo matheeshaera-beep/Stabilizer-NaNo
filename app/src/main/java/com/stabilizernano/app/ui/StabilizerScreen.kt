@@ -569,15 +569,10 @@ private fun ControlStatusCard(
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 StabilizerProfile.entries.forEach { entry ->
-                    val label = when (entry) {
-                        StabilizerProfile.AUTO -> "Auto"
-                        StabilizerProfile.ECO -> "Eco"
-                        StabilizerProfile.LIVE -> "Live"
-                    }
                     FilterChip(
                         selected = profile == entry,
                         onClick = { onSelectProfile(entry) },
-                        label = { Text(label) },
+                        label = { Text(profileLabel(entry)) },
                         colors = FilterChipDefaults.filterChipColors(
                             selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
                             selectedLabelColor = MaterialTheme.colorScheme.onPrimaryContainer
@@ -1118,10 +1113,16 @@ private fun SettingsTabContent(
                         FilterChip(
                             selected = profile == entry,
                             onClick = { onSelectProfile(entry) },
-                            label = { Text(entry.name.lowercase().replaceFirstChar { it.uppercase() }) }
+                            label = { Text(profileLabel(entry)) }
                         )
                     }
                 }
+
+                Text(
+                    text = profileDescription(profile),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
 
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -1400,6 +1401,24 @@ private fun stateVisuals(state: StabilizerState): Triple<Color, Color, String> {
             MaterialTheme.colorScheme.onSurfaceVariant,
             "STOPPED"
         )
+    }
+}
+
+private fun profileLabel(profile: StabilizerProfile): String {
+    return when (profile) {
+        StabilizerProfile.AUTO -> "Auto"
+        StabilizerProfile.ECO -> "Eco"
+        StabilizerProfile.HEAL_ONLY -> "Heal Only"
+        StabilizerProfile.LIVE -> "Live"
+    }
+}
+
+private fun profileDescription(profile: StabilizerProfile): String {
+    return when (profile) {
+        StabilizerProfile.AUTO -> "Eco by default; switches to Live during calls, hotspot/tethering, Boost, or charging (if enabled)."
+        StabilizerProfile.ECO -> "Brief tail confirmation after traffic pauses, then 0 pings in Quiet standby."
+        StabilizerProfile.HEAL_ONLY -> "Lowest battery: 0 pings while healthy; probes & recovers only when a stall or drop occurs."
+        StabilizerProfile.LIVE -> "Keeps the cellular modem inside its carrier tail while the screen is on."
     }
 }
 

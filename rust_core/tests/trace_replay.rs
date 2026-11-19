@@ -247,4 +247,39 @@ fn trace_replay_benchmarks_meet_v2_efficiency_targets() {
             ..
         }
     )));
+
+    // 7. 1-hour mixed browsing/messaging in HealOnly with healthy cellular -> strictly 0 probes!
+    let heal_only_healthy = replay_trace(
+        "Mixed 1h Healthy (HealOnly)",
+        StabilizerProfile::HealOnly,
+        3_600,
+        |t, sm| {
+            if t % 300 == 0 {
+                sm.handle_event(Event::ScreenChanged {
+                    is_screen_on: false,
+                    is_unlocked: false,
+                });
+            } else if t % 300 == 120 {
+                sm.handle_event(Event::ScreenChanged {
+                    is_screen_on: true,
+                    is_unlocked: true,
+                });
+            }
+            let rx = if t % 90 < 6 { 12_000 } else { 40 };
+            let tx = if t % 90 < 3 { 400 } else { 0 };
+            sm.handle_event(Event::TrafficObserved {
+                rx_bytes_delta: rx,
+                tx_bytes_delta: tx,
+            });
+            let a = sm.handle_event(Event::TickElapsed { secs: 1 });
+            a.iter()
+                .filter(|x| matches!(x, Action::SendProbe { .. }))
+                .count()
+        },
+    );
+    assert_eq!(
+        heal_only_healthy.probes, 0,
+        "{} must send 0 probes while cellular link is healthy",
+        heal_only_healthy.name
+    );
 }

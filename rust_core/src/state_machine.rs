@@ -43,6 +43,8 @@ pub enum StabilizerProfile {
     Auto,
     /// Zero periodic keepalives after brief tail settle; wakes on real traffic, RX/TX stall, or radio topology events.
     Eco,
+    /// Pure reactive mode: 0 pings while the cellular link is healthy; probes and recovers only on TX stalls, unvalidated links, or OS link blocks.
+    HealOnly,
     /// Keeps the cellular modem inside its RRC tail window whenever screen is on (and safe battery/Wi-Fi checks pass).
     Live,
 }
@@ -410,6 +412,12 @@ impl StateMachine {
         false
     }
 
+    /// Returns `true` when pure reactive Heal-Only mode is active (0 pings while healthy,
+    /// unless the user explicitly activates temporary `Boost`).
+    pub fn is_heal_only(&self) -> bool {
+        self.config.profile == StabilizerProfile::HealOnly && !self.context.boost_active
+    }
+
     /// Returns `true` when context and profile justify keeping the cellular radio tail warm.
     pub fn is_live_eligible(&self) -> bool {
         if self.context.is_wifi_default && !self.context.has_active_tethering() {
@@ -423,15 +431,23 @@ impl StateMachine {
             return false;
         }
 
-        // Explicit user overrides (Boost 30m, in-call, active tethering, or Live profile)
-        // honor keepalive intent even when Android Battery Saver is active.
-        if self.context.boost_active || self.context.in_call || self.context.has_active_tethering()
-        {
+        // Explicit Boost 30m override honors keepalive intent even in HealOnly or Battery Saver.
+        if self.context.boost_active {
+            return true;
+        }
+
+        if self.config.profile == StabilizerProfile::HealOnly {
+            return false;
+        }
+
+        // In-call, active tethering, or explicit Live profile honor keepalive intent
+        // even when Android Battery Saver is active.
+        if self.context.in_call || self.context.has_active_tethering() {
             return true;
         }
 
         match self.config.profile {
-            StabilizerProfile::Eco => false,
+            StabilizerProfile::Eco | StabilizerProfile::HealOnly => false,
             StabilizerProfile::Live => true,
             StabilizerProfile::Auto => {
                 !self.context.low_battery_or_saver
@@ -468,7 +484,7 @@ impl StateMachine {
                 self.state_reason = self.live_reason_label();
             }
         } else if self.state == StabilizerState::LiveKeepalive {
-            if self.is_quiet_forced() || self.context.low_battery_or_saver {
+            if self.is_quiet_forced() || self.context.low_battery_or_saver || self.is_heal_only() {
                 let label = self.quiet_reason_label();
                 self.transition_to(StabilizerState::Quiet, &label, actions);
             } else {
@@ -480,6 +496,16 @@ impl StateMachine {
                     actions,
                 );
             }
+        } else if self.is_heal_only()
+            && matches!(
+                self.state,
+                StabilizerState::EcoTailCheck | StabilizerState::Warmup
+            )
+        {
+            let label = self.quiet_reason_label();
+            self.transition_to(StabilizerState::Quiet, &label, actions);
+        } else if self.state == StabilizerState::Quiet {
+            self.state_reason = self.quiet_reason_label();
         }
     }
 
@@ -512,6 +538,9 @@ impl StateMachine {
                     );
                 } else if self.has_internet && !self.is_validated {
                     self.enter_recovering("Started on unvalidated cellular link", &mut actions);
+                } else if self.has_internet && self.is_heal_only() {
+                    let label = self.quiet_reason_label();
+                    self.transition_to(StabilizerState::Quiet, &label, &mut actions);
                 } else if self.has_internet {
                     self.transition_to(
                         StabilizerState::Warmup,
@@ -569,13 +598,18 @@ impl StateMachine {
                             &mut actions,
                         );
                     } else if self.context.has_active_tethering() && was_screen_on {
-                        actions.push(Action::Log(
-                            LogLevel::Info,
+                        let msg = if self.is_heal_only() {
+                            format!(
+                                "Screen off while tethering ({} clients) -> Heal-Only monitoring",
+                                self.context.hotspot_clients
+                            )
+                        } else {
                             format!(
                                 "Screen off while tethering ({} clients) -> keeping Live",
                                 self.context.hotspot_clients
-                            ),
-                        ));
+                            )
+                        };
+                        actions.push(Action::Log(LogLevel::Info, msg));
                     }
                     return actions;
                 }
@@ -600,7 +634,9 @@ impl StateMachine {
 
                     if self.has_internet && !self.is_validated {
                         self.enter_recovering("Screen wake on unvalidated link", &mut actions);
-                    } else if self.has_internet {
+                    } else if self.has_internet
+                        && (!self.is_heal_only() || self.state == StabilizerState::Outage)
+                    {
                         self.transition_to(
                             StabilizerState::Warmup,
                             "Screen wake -> Warmup check",
@@ -610,6 +646,11 @@ impl StateMachine {
                             tier: ProbeTier::L1Dns,
                             reason: PingReason::Warmup,
                         });
+                    } else if self.has_internet
+                        && self.is_heal_only()
+                        && self.state == StabilizerState::Quiet
+                    {
+                        self.state_reason = self.quiet_reason_label();
                     }
                 }
             }
@@ -638,15 +679,25 @@ impl StateMachine {
                 if prev_wifi && !self.context.is_wifi_default && self.has_internet {
                     self.idle_secs = 0;
                     self.eco_checks_sent = 0;
-                    self.transition_to(
-                        StabilizerState::Warmup,
-                        "Switched to cellular -> Warmup check",
-                        &mut actions,
-                    );
-                    actions.push(Action::SendProbe {
-                        tier: ProbeTier::L1Dns,
-                        reason: PingReason::RadioEvent,
-                    });
+                    if !self.is_validated {
+                        self.enter_recovering(
+                            "Switched to unvalidated cellular link",
+                            &mut actions,
+                        );
+                    } else if self.is_heal_only() {
+                        let label = self.quiet_reason_label();
+                        self.transition_to(StabilizerState::Quiet, &label, &mut actions);
+                    } else {
+                        self.transition_to(
+                            StabilizerState::Warmup,
+                            "Switched to cellular -> Warmup check",
+                            &mut actions,
+                        );
+                        actions.push(Action::SendProbe {
+                            tier: ProbeTier::L1Dns,
+                            reason: PingReason::RadioEvent,
+                        });
+                    }
                     return actions;
                 }
 
@@ -655,15 +706,19 @@ impl StateMachine {
                     && self.state == StabilizerState::Quiet
                 {
                     self.idle_secs = 0;
-                    self.transition_to(
-                        StabilizerState::Warmup,
-                        "Tethering client connected -> Warmup",
-                        &mut actions,
-                    );
-                    actions.push(Action::SendProbe {
-                        tier: ProbeTier::L1Dns,
-                        reason: PingReason::Warmup,
-                    });
+                    if self.is_heal_only() {
+                        self.state_reason = self.quiet_reason_label();
+                    } else {
+                        self.transition_to(
+                            StabilizerState::Warmup,
+                            "Tethering client connected -> Warmup",
+                            &mut actions,
+                        );
+                        actions.push(Action::SendProbe {
+                            tier: ProbeTier::L1Dns,
+                            reason: PingReason::Warmup,
+                        });
+                    }
                 } else if self.is_quiet_forced()
                     && !matches!(self.state, StabilizerState::Quiet | StabilizerState::Outage)
                 {
@@ -696,11 +751,10 @@ impl StateMachine {
 
                 if has_internet && !is_validated {
                     if self.uptime_secs >= self.post_root_settle_until_uptime_secs
+                        && !self.is_quiet_forced()
                         && !matches!(
                             self.state,
-                            StabilizerState::Quiet
-                                | StabilizerState::Recovering
-                                | StabilizerState::Outage
+                            StabilizerState::Recovering | StabilizerState::Outage
                         )
                     {
                         self.enter_recovering("Lost NET_CAPABILITY_VALIDATED", &mut actions);
@@ -717,22 +771,27 @@ impl StateMachine {
                         )
                     {
                         self.reset_recovery_episode();
-                        let next_state = if self.is_quiet_forced() {
+                        let next_state = if self.is_quiet_forced() || self.is_heal_only() {
                             StabilizerState::Quiet
                         } else {
                             StabilizerState::Active
                         };
                         self.transition_to(next_state, "Cellular link validated", &mut actions);
                     } else if !had_internet && !self.is_quiet_forced() {
-                        self.transition_to(
-                            StabilizerState::Warmup,
-                            "Cellular internet restored -> Warmup",
-                            &mut actions,
-                        );
-                        actions.push(Action::SendProbe {
-                            tier: ProbeTier::L1Dns,
-                            reason: PingReason::RadioEvent,
-                        });
+                        if self.is_heal_only() {
+                            let label = self.quiet_reason_label();
+                            self.transition_to(StabilizerState::Quiet, &label, &mut actions);
+                        } else {
+                            self.transition_to(
+                                StabilizerState::Warmup,
+                                "Cellular internet restored -> Warmup",
+                                &mut actions,
+                            );
+                            actions.push(Action::SendProbe {
+                                tier: ProbeTier::L1Dns,
+                                reason: PingReason::RadioEvent,
+                            });
+                        }
                     }
                 } else if !has_internet && matches!(self.state, StabilizerState::Recovering) {
                     self.reset_recovery_episode();
@@ -753,8 +812,12 @@ impl StateMachine {
                 if self.state == StabilizerState::Recovering {
                     return actions;
                 }
-                let is_link_disruption = reason.contains("blocked") || reason.contains("Link");
+                let is_blocked = reason.contains("blocked") && !reason.contains("unblocked");
+                let is_link_disruption = is_blocked || reason.contains("Link");
                 if self.state == StabilizerState::Active && !is_link_disruption {
+                    return actions;
+                }
+                if self.is_heal_only() && self.state != StabilizerState::Outage && !is_blocked {
                     return actions;
                 }
                 self.secs_since_last_probe = 0;
@@ -858,7 +921,7 @@ impl StateMachine {
                         StabilizerState::Recovering | StabilizerState::Outage
                     ) {
                         self.reset_recovery_episode();
-                        let next_state = if self.is_quiet_forced() {
+                        let next_state = if self.is_quiet_forced() || self.is_heal_only() {
                             StabilizerState::Quiet
                         } else if self.is_live_eligible() {
                             StabilizerState::LiveKeepalive
@@ -870,6 +933,9 @@ impl StateMachine {
                             &format!("{tier:?} probe succeeded -> link healthy"),
                             &mut actions,
                         );
+                    } else if self.is_heal_only() && self.state == StabilizerState::Warmup {
+                        let label = self.quiet_reason_label();
+                        self.transition_to(StabilizerState::Quiet, &label, &mut actions);
                     }
                 } else {
                     // Any live/tail/warmup probe failure escalates into Recovering immediately,
@@ -1101,7 +1167,7 @@ impl StateMachine {
                     return actions;
                 }
 
-                if self.context.low_battery_or_saver {
+                if self.context.low_battery_or_saver || self.is_heal_only() {
                     let label = self.quiet_reason_label();
                     self.transition_to(StabilizerState::Quiet, &label, &mut actions);
                     return actions;
@@ -1295,10 +1361,14 @@ impl StateMachine {
     fn quiet_reason_label(&self) -> String {
         if self.context.is_wifi_default && !self.context.has_active_tethering() {
             "Quiet · Wi-Fi default · 0 pings".to_owned()
-        } else if self.context.low_battery_or_saver {
-            "Quiet · battery saver · 0 pings".to_owned()
         } else if self.context.is_doze {
             "Quiet · Doze · 0 pings".to_owned()
+        } else if !self.is_screen_on && !self.context.has_active_tethering() {
+            "Quiet · screen off · 0 pings".to_owned()
+        } else if self.is_heal_only() {
+            "Quiet · heal-only · 0 pings".to_owned()
+        } else if self.context.low_battery_or_saver {
+            "Quiet · battery saver · 0 pings".to_owned()
         } else if !self.is_screen_on {
             "Quiet · screen off · 0 pings".to_owned()
         } else {
@@ -1596,9 +1666,10 @@ mod tests {
         };
 
         for _ in 0..2_000 {
-            let profile = match next_u64() % 3 {
+            let profile = match next_u64() % 4 {
                 0 => StabilizerProfile::Auto,
                 1 => StabilizerProfile::Eco,
+                2 => StabilizerProfile::HealOnly,
                 _ => StabilizerProfile::Live,
             };
             let mut sm = StateMachine::new(StabilizerConfig {
@@ -1963,5 +2034,153 @@ mod tests {
             fired_at <= 8,
             "first keepalive fired at {fired_at}s (past 8s RRC tail)"
         );
+    }
+
+    #[test]
+    fn heal_only_sends_zero_pings_when_healthy_and_heals_drops_immediately() {
+        let mut sm = StateMachine::new(StabilizerConfig {
+            profile: StabilizerProfile::HealOnly,
+            ..StabilizerConfig::default()
+        });
+        sm.handle_event(Event::NetworkCapabilitiesChanged {
+            has_internet: true,
+            is_validated: true,
+        });
+        sm.handle_event(Event::ScreenChanged {
+            is_screen_on: true,
+            is_unlocked: true,
+        });
+
+        // 1. Start on healthy cellular link -> Quiet with 0 pings (no Warmup).
+        let start_actions = sm.handle_event(Event::Start);
+        assert_eq!(count_probes(&start_actions), 0);
+        assert_eq!(sm.state(), StabilizerState::Quiet);
+        assert!(sm.state_reason().contains("heal-only"));
+
+        // 2. Screen off -> screen wake/unlock -> 0 pings.
+        assert_eq!(
+            count_probes(&sm.handle_event(Event::ScreenChanged {
+                is_screen_on: false,
+                is_unlocked: false,
+            })),
+            0
+        );
+        assert_eq!(
+            count_probes(&sm.handle_event(Event::ScreenChanged {
+                is_screen_on: true,
+                is_unlocked: true,
+            })),
+            0
+        );
+        assert_eq!(sm.state(), StabilizerState::Quiet);
+
+        // 3. Video/browsing traffic burst followed by 60s idle -> Active -> Quiet with 0 EcoTail pings.
+        sm.handle_event(Event::TrafficObserved {
+            rx_bytes_delta: 40_000,
+            tx_bytes_delta: 1_200,
+        });
+        assert_eq!(
+            count_probes(&sm.handle_event(Event::TickElapsed { secs: 1 })),
+            0
+        );
+        assert_eq!(sm.state(), StabilizerState::Active);
+
+        for _ in 0..60 {
+            sm.handle_event(Event::TrafficObserved {
+                rx_bytes_delta: 20,
+                tx_bytes_delta: 10,
+            });
+            assert_eq!(
+                count_probes(&sm.handle_event(Event::TickElapsed { secs: 1 })),
+                0
+            );
+        }
+        assert_eq!(sm.state(), StabilizerState::Quiet);
+
+        // 4. Wi-Fi -> cellular switch, RAT transition, and hotspot client -> still 0 healthy pings.
+        sm.handle_event(Event::ContextChanged(RuntimeContext {
+            is_wifi_default: true,
+            ..RuntimeContext::default()
+        }));
+        assert_eq!(
+            count_probes(&sm.handle_event(Event::ContextChanged(RuntimeContext {
+                is_wifi_default: false,
+                hotspot_clients: 1,
+                ..RuntimeContext::default()
+            }))),
+            0
+        );
+        assert_eq!(
+            count_probes(&sm.handle_event(Event::RadioTopologyChanged {
+                reason: "RAT transition".to_owned(),
+            })),
+            0
+        );
+        assert_eq!(
+            count_probes(&sm.handle_event(Event::RadioTopologyChanged {
+                reason: "Cellular unblocked".to_owned(),
+            })),
+            0
+        );
+
+        // 5. Real drop #1: silent TX stall from Quiet -> immediate L2 StallCheck probe!
+        sm.handle_event(Event::TrafficObserved {
+            rx_bytes_delta: 0,
+            tx_bytes_delta: 200,
+        });
+        let stall_actions = sm.handle_event(Event::TickElapsed { secs: 2 });
+        assert_eq!(sm.state(), StabilizerState::Recovering);
+        assert_eq!(count_probes(&stall_actions), 1);
+
+        // Once healed, returns straight back to Quiet (0 follow-up EcoTail pings).
+        sm.handle_event(Event::ProbeCompleted {
+            tier: ProbeTier::L2HttpHead,
+            reason: PingReason::StallCheck,
+            succeeded: true,
+        });
+        assert_eq!(sm.state(), StabilizerState::Quiet);
+        assert_eq!(sm.stalls_healed(), 1);
+
+        // 6. Real drop #2: Lost NET_CAPABILITY_VALIDATED while Quiet on screen -> immediate recovery!
+        let unval_actions = sm.handle_event(Event::NetworkCapabilitiesChanged {
+            has_internet: true,
+            is_validated: false,
+        });
+        assert_eq!(sm.state(), StabilizerState::Recovering);
+        assert_eq!(count_probes(&unval_actions), 1);
+
+        sm.handle_event(Event::NetworkCapabilitiesChanged {
+            has_internet: true,
+            is_validated: true,
+        });
+        assert_eq!(sm.state(), StabilizerState::Quiet);
+
+        // 7. Real drop #3: OS blocked status -> immediate check!
+        let blocked_actions = sm.handle_event(Event::RadioTopologyChanged {
+            reason: "Cellular blocked by OS/modem".to_owned(),
+        });
+        assert_eq!(count_probes(&blocked_actions), 1);
+        sm.handle_event(Event::ProbeCompleted {
+            tier: ProbeTier::L1Dns,
+            reason: PingReason::RadioEvent,
+            succeeded: true,
+        });
+        assert_eq!(sm.state(), StabilizerState::Quiet);
+
+        // 8. Explicit Boost 30m temporarily enables LiveKeepalive, then returns cleanly to Quiet · heal-only.
+        let boost_on = sm.handle_event(Event::ContextChanged(RuntimeContext {
+            boost_active: true,
+            ..RuntimeContext::default()
+        }));
+        assert_eq!(sm.state(), StabilizerState::LiveKeepalive);
+        assert_eq!(count_probes(&boost_on), 1);
+
+        let boost_off = sm.handle_event(Event::ContextChanged(RuntimeContext {
+            boost_active: false,
+            ..RuntimeContext::default()
+        }));
+        assert_eq!(sm.state(), StabilizerState::Quiet);
+        assert_eq!(count_probes(&boost_off), 0);
+        assert!(sm.state_reason().contains("heal-only"));
     }
 }
